@@ -24,6 +24,8 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <strbuffer.h> // from jansson, for strbuffer_t
+
 #include "cashaddr.h"
 #include "asicseer-pool.h"
 #include "donation.h"
@@ -41,16 +43,23 @@
 static const char *workpadding = "000000800000000000000000000000000000000000000000000000000000000000000000000000000000000080020000";
 static const char *scriptsig_header = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff";
 static uchar scriptsig_header_bin[41];
+#define MAX_COINBASE_TX_LEN 1000000 /* =1MB Maximum size of a coinbase tx in bytes, total. BCH consensus rule. */
+#define MAX_COINBASE_SCRIPTSIG_LEN 100 /* BCH consensus rule -- scriptsig cannot exceed 100 bytes */
+#define TX_RESERVE_SIZE (41 + 1 + MAX_COINBASE_SCRIPTSIG_LEN + 4 + 1 + 2 + 4)
+#define MAX_CB_SPACE (MAX_COINBASE_TX_LEN - TX_RESERVE_SIZE)
 static const double nonces = 4294967296;
 
 #define HERP_N		5 /* 5 * network diff SPLNS */
-#define CBGENLEN	33 /* Maximum extra space required per user in coinbase */
+#define CBGENLEN	34 /* Maximum extra space required per user in coinbase */
 #define DERP_DUST	5460 /* Minimum DERP to get onto payout list */
 #define PAYOUT_DUST	DUST_LIMIT_SATS /* Minimum payout not dust -- currently 546 sats */
 #define DERP_SPACE	1000 /* Minimum derp to warrant leaving coinbase space */
-#define PAYOUT_USERS	100 /* Number of top users that get reward each block */
-#define PAYOUT_REWARDS	150 /* Max number of users rewarded each block */
+#define PAYOUT_USERS    1000 /* Number of top users that get reward each block */
+#define PAYOUT_REWARDS  1500 /* Max number of users rewarded each block */
 #define SATOSHIS	100000000 /* Satoshi to a BTC */
+#if PAYOUT_REWARDS * CBGENLEN > MAX_CB_SPACE
+#error Please set PAYOUT_REWARDS to fit inside a coinbase tx (MAX_CB_SPACE)!
+#endif
 
 typedef struct json_entry json_entry_t;
 typedef struct generation generation_t;
@@ -519,12 +528,14 @@ struct stratifier_data {
 	sem_t update_sem;
 	/* Time we last sent out a stratum update */
 	time_t update_time;
+	mutex_t update_time_lock; ///< guards update_time
 
 	int64_t workbase_id;
 	int64_t blockchange_id;
 	int session_id;
 	char lasthash[68];
 	char lastswaphash[68];
+	mutex_t last_hash_lock; ///< guards lasthash and lastswaphash
 
 	ckmsgq_t *updateq;	// Generator base work updates
 	ckmsgq_t *ssends;	// Stratum sends
@@ -629,29 +640,67 @@ static int postponed_sort(generation_t *a, generation_t *b)
 	return (b->postponed - a->postponed);
 }
 
-// add an amount,scriptbin to the current coinb2bin generation. Returns a pointer to the amount64 for the txn.
-static uint64_t *_add_txnbin(workbase_t *wb, uint64_t *gentxns, uint64_t amount, const void *txnbin, size_t txnlen)
-{
-	uint64_t *u64 = (uint64_t *)&wb->coinb2bin[wb->coinb2len];
-	*u64 = htole64(amount);
-	wb->coinb2len += 8;
+typedef struct {
+	strbuffer_t buffer;
+	size_t num_txns;
+} txns_buffer_t;
 
-	wb->coinb2bin[wb->coinb2len++] = (uchar)txnlen;
-	memcpy(wb->coinb2bin + wb->coinb2len, txnbin, txnlen);
-	wb->coinb2len += txnlen;
-	/* Increment number of generation transactions */
-	*gentxns = htole64(le64toh(*gentxns) + 1UL);
-	return u64;
+static void txns_buffer_give(txns_buffer_t *t, void **buf, size_t pos, size_t capacity)
+{
+	assert(t);
+	assert(buf && *buf);
+	assert(capacity);
+	assert(pos <= capacity);
+
+	memset(t, 0, sizeof(*t));
+	t->buffer.data = *buf;
+	*buf = NULL;
+	t->buffer.length = pos;
+	t->buffer.size = capacity;
+	t->num_txns = 0;
 }
-/* Add generation transactions to the coinbase for each user, return any spare
+
+static void txns_buffer_take(txns_buffer_t *t, void **bufptr, size_t *pos, size_t *capacity)
+{
+	assert(bufptr);
+	if (pos) *pos = t->buffer.length;
+	if (capacity) *capacity = t->buffer.size;
+	*bufptr = strbuffer_steal_value(&t->buffer);
+}
+
+/// Add an amount[8 bytes],scriptbinlen[1 byte],scriptbin[txnlen bytes] to txns_buffer_t `buf`.
+/// Returns an index into the buffer where the amount data begins on success.
+/// On failure (which is unlikely) this function will call quit().  So this always returns on success.
+/// IMPORTANT: txnlen must be <253 bytes otherwise this will always fail.
+static size_t _add_txnbin(txns_buffer_t *buf, uint64_t amount, const void *txnbin, size_t txnlen)
+{
+	const size_t size = 8 + 1 + txnlen;
+	uint8_t *tmp = alloca(size);
+	const size_t ret = buf->buffer.length;
+	*(uint64_t *)tmp = htole64(amount); // this is guaranteed aligned access
+	if (unlikely(txnlen >= 253)) {
+		quit(1, "INTERNAL ERROR: %s: txnlen must be <253 bytes!", __FUNCTION__);
+		return 0; // not reached
+	}
+	tmp[8] = (uint8_t)txnlen;
+	memcpy(tmp + 9, txnbin, txnlen);
+	if (unlikely(strbuffer_append_bytes(&buf->buffer, (const char *)tmp, size) != 0)) {
+		quit(1, "INTERNAL ERROR: %s: buffer size overflow, strbuffer is too large: %lu",
+		     __FUNCTION__, buf->buffer.size);
+		return 0; // not reached
+	}
+	assert(++buf->num_txns && "INTERNAL ERROR: integer overflow for txns_buffer_t::num_txns!");
+	return ret;
+}
+
+/* Add generation transactions to the transaction buffer `txns` for each user, return any spare
  * change. Note that the return value may be negative if users had fee discounts,
  * in which case there is "negative" change and the pool output must deduct this amount
  * from its own output (that is, add the negative to the pool output value).  This negative
  * output will never result in the pf64 (fee) value becoming smaller than the dust limit,
  * however -- so the pool may safely just add whatever the negative return value is
  * (or add the positive return value which will always be >=546 sats).*/
-static int64_t add_user_generation(sdata_t *sdata, workbase_t *wb, uint64_t g64, uint64_t pf64,
-                                   uint64_t *gentxns)
+static int64_t add_user_generation(sdata_t *sdata, workbase_t *wb, txns_buffer_t *txns, uint64_t g64, uint64_t pf64)
 {
 	json_t * const payout = json_object(),
 	       * const payout_entries = json_object(),
@@ -660,10 +709,10 @@ static int64_t add_user_generation(sdata_t *sdata, workbase_t *wb, uint64_t g64,
 	int64_t total = g64;
 	int64_t total_fee_discounts = 0;
 	const int64_t s_pf64 = (int64_t)pf64; // signed version of pf64
-	uint64_t *u64 = NULL;
+	size_t amt_pos = 0;
 	struct payee_info {
 		uint64_t reward;
-		uint64_t *cb_u64;
+		size_t amt_pos;
 		user_instance_t *user;
 	} max_payee = {0,0,0};
 
@@ -720,18 +769,18 @@ static int64_t add_user_generation(sdata_t *sdata, workbase_t *wb, uint64_t g64,
 		}
 		json_set_double(payout_entries, user->username, total_reward / (double)SATOSHIS);
 		if (credit)
-			LOGINFO("User %s reward %"PRIu64" + %"PRId64 " fee discount credit (%0.2f%% fee discount)",
-			        user->username, reward, credit, user->fee_discount * 100.0);
+			LOGINFO("User %s reward %"PRIu64" + %"PRId64 " fee discount credit (%0.2f%% fee discount) = %1.8f total",
+			        user->username, reward, credit, user->fee_discount * 100.0, total_reward / (double)SATOSHIS);
 		else
-			LOGINFO("User %s reward %"PRIu64, user->username, total_reward);
+			LOGINFO("User %s reward %1.8f", user->username, total_reward / (double)SATOSHIS);
 
 		/* Add the user's coinbase reward, using the cached cscript */
-		u64 = _add_txnbin(wb, gentxns, total_reward, user->txnbin, user->txnlen);
+		amt_pos = _add_txnbin(txns, total_reward, user->txnbin, user->txnlen);
 
 		if (!pf64 && total_reward > max_payee.reward) {
 			// remember this as the largest payee in case we need to give them leftover dust
 			max_payee.reward = total_reward;
-			max_payee.cb_u64 = u64;
+			max_payee.amt_pos = amt_pos;
 			max_payee.user = user;
 		}
 		// deduct this total reward from the payee total -- note total may end up negative here if
@@ -743,8 +792,10 @@ static int64_t add_user_generation(sdata_t *sdata, workbase_t *wb, uint64_t g64,
 		// payout remaining dust to the user with the most hash, because there is no pool fee (and so no pool payout output)
 		const char * const username = max_payee.user->username;
 		LOGDEBUG("Added %"PRId64" sats in dust to most-hash-payee: %s", total, username);
-		const uint64_t newreward = max_payee.reward + total;
-		*(max_payee.cb_u64) = htole64(newreward); // update coinbase binary
+		uint64_t newreward = max_payee.reward + total;
+		newreward = htole64(newreward);
+		// update coinbase binary, avoiding unaligned access issues by doing a byte copy
+		memcpy(txns->buffer.value + max_payee.amt_pos, &newreward, sizeof(newreward));
 		total = 0;
 		json_set_double(payout_entries, username, newreward / (double)SATOSHIS); // update json
 	}
@@ -763,17 +814,17 @@ skip:
 	return total;
 }
 
+/// This is called in a serialized context (form a ckmsgq)
 static void generate_coinbase(const pool_t *ckp, workbase_t *wb)
 {
-	uint64_t *p64 = NULL, g64 = 0, f64 = 0, pf64 = 0, df64 = 0, *gentxns = NULL;
+	const int64_t t0 = time_micros();
+	uint64_t g64 = 0, f64 = 0, pf64 = 0, df64 = 0;
 	sdata_t *sdata = ckp->sdata;
-	int len, ofs = 0, cbspace;
+	int len, ofs = 0;
 	char header[228];
-	ts_t now;
-
-	mutex_lock(&sdata->stats_lock);
-	cbspace = sdata->stats.cbspace;
-	mutex_unlock(&sdata->stats_lock);
+	txns_buffer_t txns_buf;
+	size_t pool_amt_pos = 0;
+	bool pool_has_amt = false;
 
 	/* Set fixed length coinb1 arrays to be more than enough */
 	wb->coinb1 = ckzalloc(256);
@@ -786,27 +837,20 @@ static void generate_coinbase(const pool_t *ckp, workbase_t *wb)
 
 	ofs++; // Script length is filled in at the end @wb->coinb1bin[41];
 
-	/* Put block height at start of template */
+	/* Put block height at start of template (consensus rule) */
 	len = ser_number(wb->coinb1bin + ofs, wb->height);
 	ofs += len;
 
-	/* Followed by flag */
-	len = strlen(wb->flags) / 2;
-	wb->coinb1bin[ofs++] = len;
-	hex2bin(wb->coinb1bin + ofs, wb->flags, len);
+	// just write the current time in micros directly, in host byte order
+	len = sizeof(t0);
+	memcpy(wb->coinb1bin + ofs, &t0, len);
 	ofs += len;
 
-	/* Followed by timestamp */
-	ts_realtime(&now);
-	len = ser_number(wb->coinb1bin + ofs, now.tv_sec);
-	ofs += len;
-
-	/* Followed by our unique randomiser based on the nsec timestamp */
-	len = ser_number(wb->coinb1bin + ofs, now.tv_nsec);
-	ofs += len;
-
+	// Make room for the nonce data (usually 12 bytes). this will come from the client
+	// when they submit their shares.
 	wb->enonce1varlen = ckp->nonce1length;
 	wb->enonce2varlen = ckp->nonce2length;
+	// save nonce length to scriptsig
 	wb->coinb1bin[ofs++] = wb->enonce1varlen + wb->enonce2varlen;
 
 	wb->coinb1len = ofs;
@@ -816,39 +860,46 @@ static void generate_coinbase(const pool_t *ckp, workbase_t *wb)
 	len += wb->enonce1varlen;
 	len += wb->enonce2varlen;
 
-	wb->coinb2bin = ckzalloc(512 + cbspace);
+	static const size_t COINB2_INITIAL_CAPACITY = 512;
+
+	wb->coinb2bin = ckzalloc(COINB2_INITIAL_CAPACITY);
 	wb->coinb2len = 0;
 	{
-		// ensure that what follows is <253 bytes total for the buffer otherwise bad things
-		// may happen because we assume 1 byte for length of this thing.
-		// TODO: use ser_number and/or see if this matters. -Calin
-		int spaceLeft = 253 - len;
-		char cbprefix[] = "#/" HARDCODED_COINBASE_PREFIX_STR " ";
+		// ensure that what follows is <=100 bytes total for the scriptsig otherwise
+		// block will be rejected as per BCH consensus rules.
+		int spaceLeft = MAX_COINBASE_SCRIPTSIG_LEN - len + 1; // <-- +1 here is because 'len' accounts for the scriptsig length byte, which is not counted towards the 100-byte total
+		char cbprefix[] = "/" HARDCODED_COINBASE_PREFIX_STR " ";
 		static const char cbsuffix[] = HARDCODED_COINBASE_SUFFIX_STR "/";
-		static const size_t cbsuffix_len = sizeof(cbsuffix)-1;
-		size_t cbprefix_len = sizeof(cbprefix)-1;
-		if (!*HARDCODED_COINBASE_PREFIX_STR) {
+		static const int cbsuffix_len = sizeof(cbsuffix)-1;
+		int cbprefix_len = sizeof(cbprefix)-1;
+		if (!*HARDCODED_COINBASE_PREFIX_STR && cbprefix_len) {
 			// prefix string is empty, cut off the hard-coded trailing space
 			cbprefix[--cbprefix_len] = 0;
 		}
 		int n = MIN(cbprefix_len, spaceLeft);
 		if (n > 0) {
-			memcpy(wb->coinb2bin, cbprefix, n);
+			memcpy(wb->coinb2bin + wb->coinb2len, cbprefix, n);
 			wb->coinb2len += n;
 			spaceLeft -= n;
 		}
-		if (ckp->bchsig && spaceLeft > 0) {
-			const int siglen = strlen(ckp->bchsig);
-			const int len2write = MIN(siglen, spaceLeft);
+		{
+			// Add user sig text. Note: we limit its size to what's left over after accounting for the
+			// prefix and suffix strings.
+			const bool hasSuffix = *HARDCODED_COINBASE_SUFFIX_STR;
+			const int sigSpace = spaceLeft - cbsuffix_len - (hasSuffix ? 1 : 0);
+			if (ckp->bchsig && sigSpace > 0) {
+				const int siglen = strlen(ckp->bchsig);
+				n = MIN(siglen, sigSpace);
 
-			LOGDEBUG("Len %d sig: %s", len2write, ckp->bchsig);
-			if (len2write > 0) {
-				memcpy(wb->coinb2bin + wb->coinb2len, ckp->bchsig, len2write);
-				wb->coinb2len += len2write;
-				spaceLeft -= len2write;
-				if (*HARDCODED_COINBASE_SUFFIX_STR && spaceLeft > 0) {
-					wb->coinb2bin[wb->coinb2len++] = ' '; // add a space for non-empty suffix
-					--spaceLeft;
+				LOGDEBUG("Len %d sig: \"%s\"", n, ckp->bchsig);
+				if (n > 0) {
+					memcpy(wb->coinb2bin + wb->coinb2len, ckp->bchsig, n);
+					wb->coinb2len += n;
+					spaceLeft -= n;
+					if (hasSuffix && spaceLeft > 0) {
+						wb->coinb2bin[wb->coinb2len++] = ' '; // add a space for non-empty suffix
+						--spaceLeft;
+					}
 				}
 			}
 		}
@@ -858,23 +909,37 @@ static void generate_coinbase(const pool_t *ckp, workbase_t *wb)
 			wb->coinb2len += n;
 			spaceLeft -= n;
 		}
-		// mark length at beginning of text just before first '/', just to be sure.
-		// TODO: ser_number here?
-		wb->coinb2bin[0] = (uchar)(wb->coinb2len-1);
-		LOGDEBUG("CB text: %.*s", wb->coinb2len-1, wb->coinb2bin+1);
+		LOGDEBUG("CB text: \"%.*s\"", wb->coinb2len, wb->coinb2bin);
 	}
 	len += wb->coinb2len;
 
-	// TODO: ser_number here?
-	wb->coinb1bin[41] = len - 1; /* Set the length now  */
+	wb->coinb1bin[41] = (uchar)(len - 1); /* Set the length now - always 1 byte (length is always <=100) */
+	if (unlikely(wb->coinb1bin[41] > MAX_COINBASE_SCRIPTSIG_LEN)) {
+		// Paranoia: This should never happen. But if it does, we need to quit ASAP since mining will break.
+		// User may need to adjust config and/or contact devs.
+		quit(1, "INTERNAL ERROR: Max coinbase scriptsig length is %d, but we generated a scriptsig of "
+		     "%d bytes.  File: %s, line: %d", (int)MAX_COINBASE_SCRIPTSIG_LEN, (int)(wb->coinb1bin[41]),
+		     __FILE__, (int)__LINE__);
+	}
 	__bin2hex(wb->coinb1, wb->coinb1bin, wb->coinb1len);
 	LOGDEBUG("Coinb1: %s", wb->coinb1);
 	/* Coinbase 1 complete */
 
-	memcpy(wb->coinb2bin + wb->coinb2len, "\xff\xff\xff\xff", 4);
+	memcpy(wb->coinb2bin + wb->coinb2len, "\xff\xff\xff\xff", 4); // sequence
 	wb->coinb2len += 4;
 
-	gentxns = (uint64_t *)&wb->coinb2bin[wb->coinb2len++];
+	// at this pint wb->coinb2bin[wb->coinb2len] points to the tx.vout length field (compact size).
+	// reserve 3 bytes for this field.  Common case is we will have to move the data back by 2 bytes, however.
+	const int compact_size_pos = wb->coinb2len;
+	static const int compact_size_reserved = 3;
+	wb->coinb2len += compact_size_reserved; // point past the reserved space.
+	int first_tx_pos = wb->coinb2len;
+
+	// Now we "give" wb->coinb2bin to the txns_buffer, which may end up modifying the pointed-to buffer
+	// address as it grows the buffer.
+	txns_buffer_give(&txns_buf, (void **)&wb->coinb2bin, wb->coinb2len, COINB2_INITIAL_CAPACITY);
+	// NOTE: wb->coinb2bin will be temporarily NULL now until we "take" the buffer back.
+
 	// Generation value
 	g64 = wb->coinbasevalue; // generation (reward)
 	f64 = round(g64 * (ckp->pool_fee/100.0)); // pool fee gross (including dev donation)
@@ -897,7 +962,8 @@ static void generate_coinbase(const pool_t *ckp, workbase_t *wb)
 			pf64 = f64 - df64;
 
 			// add pool net fee
-			p64 = _add_txnbin(wb, gentxns, pf64, sdata->txnbin, sdata->txnlen);
+			pool_amt_pos = _add_txnbin(&txns_buf, pf64, sdata->txnbin, sdata->txnlen);
+			pool_has_amt = true;
 			const double fee = pf64 / (double)SATOSHIS;
 			LOGDEBUG("%1.8f pool fee to pool address: %s", fee, ckp->bchaddress);
 			// now add donations for each dev
@@ -906,7 +972,7 @@ static void generate_coinbase(const pool_t *ckp, workbase_t *wb)
 				for (int i = 0; i < DONATION_NUM_ADDRESSES && leftover > 0; ++i) {
 					if (sdata->donation_data[i].txnlen && ckp->dev_donations[i].valid) {
 						// good address
-						_add_txnbin(wb, gentxns, don_each, sdata->donation_data[i].txnbin, sdata->donation_data[i].txnlen);
+						_add_txnbin(&txns_buf, don_each, sdata->donation_data[i].txnbin, sdata->donation_data[i].txnlen);
 						leftover -= (int64_t)don_each;
 						const double d = don_each / (double)SATOSHIS;
 						LOGDEBUG("%f dev donation to address: %s", d, ckp->dev_donations[i].address);
@@ -919,7 +985,14 @@ static void generate_coinbase(const pool_t *ckp, workbase_t *wb)
 				pf64 += leftover;
 				df64 -= leftover;
 				leftover = 0;
-				*p64 = htole64(pf64);
+#define SET_POOL_AMT(amt) \
+	do { \
+		uint64_t le_amt = amt; \
+		le_amt = htole64(le_amt); \
+		assert(pool_has_amt); \
+		memcpy(txns_buf.buffer.value + pool_amt_pos, &le_amt, sizeof(le_amt)); \
+	} while(0)
+				SET_POOL_AMT(pf64);
 				LOGDEBUG("%f leftover from dev donations back to pool address: %s", d, ckp->bchaddress);
 			} else if (unlikely(leftover < 0)) {
 				// This should never happen but is here as a defensive programming measure.
@@ -930,29 +1003,35 @@ static void generate_coinbase(const pool_t *ckp, workbase_t *wb)
 			f64 = pf64 = 0;
 		}
 
-		assert(!pf64 || p64); // if there is a pool fee (pf64), then there must have been a pool payout generated above.
+		assert(!pf64 || pool_has_amt); // if there is a pool fee (pf64), then there must have been a pool payout generated above.
 
-		c64 = add_user_generation(sdata, wb, g64 - f64, pf64, gentxns); // add miner payouts, minus total fee
+		c64 = add_user_generation(sdata, wb, &txns_buf, g64 - f64, pf64); // add miner payouts, minus total fee
 
 		/* Add any change left over from user gen to pool -- note c64 may be negative here if pool fee discounts occurred */
-		if ( c64 && (p64 || c64 >= DUST_LIMIT_SATS) && sdata->txnlen) {
+		if ( c64 && (pool_has_amt || c64 >= DUST_LIMIT_SATS) && sdata->txnlen) {
 			bool ok = false;
 			pf64 = (uint64_t)(((int64_t)pf64) + c64); // add or deduct modifiction returned from add_user_generation
-			if (!p64 && pf64 >= DUST_LIMIT_SATS) {
+			if (!pool_has_amt && pf64 >= DUST_LIMIT_SATS) {
 				// pay extra change > dust limit back to pool, new output at end
-				p64 = _add_txnbin(wb, gentxns, pf64, sdata->txnbin, sdata->txnlen);
+				pool_amt_pos = _add_txnbin(&txns_buf, pf64, sdata->txnbin, sdata->txnlen);
+				pool_has_amt = true;
 				ok = true;
-			} else if (p64 && pf64 >= DUST_LIMIT_SATS) {
+			} else if (pool_has_amt && pf64 >= DUST_LIMIT_SATS) {
 				// pay dust back to pool, re-use pool fee output (output 0)
-				*p64 = htole64( pf64 );
+				SET_POOL_AMT( pf64 );
 				ok = true;
 			}
 			if (ok) {
+				uint64_t pool_amt = 0;
+				if (pool_has_amt) {
+					memcpy(&pool_amt, txns_buf.buffer.value + pool_amt_pos, sizeof(pool_amt));
+					pool_amt = le64toh(pool_amt);
+				}
 				LOGINFO("%"PRId64" sats adjustment to pool address: %s, total pool payout now: %1.8f",
-				        c64, ckp->bchaddress, (p64 ? le64toh(*p64) : 0) / (double)SATOSHIS);
+				        c64, ckp->bchaddress, pool_amt / (double)SATOSHIS);
 			} else {
-				LOGEMERG("Unexpected state! p64 is %s, c64 is %"PRId64 ", pf64 is %"PRIu64", f64 is %"PRIu64"! FIXME in %s line %d.",
-				         p64 ? "not null" : "NULL", c64, pf64, f64, __FILE__, __LINE__);
+				LOGEMERG("Unexpected state! pool_has_amt is %d, c64 is %"PRId64 ", pf64 is %"PRIu64", f64 is %"PRIu64"! FIXME in %s line %d.",
+				         (int)pool_has_amt, c64, pf64, f64, __FILE__, __LINE__);
 			}
 			c64 = 0;
 		}
@@ -962,9 +1041,9 @@ static void generate_coinbase(const pool_t *ckp, workbase_t *wb)
 			// ourselves (missing pool bchaddress?)
 			LOGWARNING("%"PRId64" sats in change left over after generating coinbase outs! FIXME!", c64);
 		}
-		if (!p64 && pf64)
+		if (!pool_has_amt && pf64)
 			LOGWARNING("%"PRId64" sats in pool fee left over after generating coinbase outs! FIXME!", pf64);
-		if (p64 && pf64 < DUST_LIMIT_SATS)
+		if (pool_has_amt && pf64 < DUST_LIMIT_SATS)
 			LOGWARNING("%"PRId64" sats in pool fee is below dust limit (%d)! FIXME!", pf64, (int)DUST_LIMIT_SATS);
 		if (wb->payout) {
 			// tabulate this as "pool fee" in json
@@ -974,7 +1053,49 @@ static void generate_coinbase(const pool_t *ckp, workbase_t *wb)
 		}
 	} else {
 		// payout directly to pool in this mode (asicseer-db mode)
-		p64 = _add_txnbin(wb, gentxns, g64, sdata->txnbin, sdata->txnlen);
+		pool_amt_pos = _add_txnbin(&txns_buf, g64, sdata->txnbin, sdata->txnlen);
+		pool_has_amt = true;
+	}
+#undef SET_POOL_AMT
+	{
+		assert(!wb->coinb2bin);
+		// take back the coinb2 pointer, write compact size before the txns.
+		// note that we may have to move the data blob back by 2 bytes here.
+		const size_t num_txns = txns_buf.num_txns;
+		size_t endpos, cap;
+		txns_buffer_take(&txns_buf, (void **)&wb->coinb2bin, &endpos, &cap);
+		LOGDEBUG("Coinb2 taken, endpos: %lu cap: %lu", endpos, cap);
+		assert(endpos + wb->coinb1len + wb->enonce1varlen + wb->enonce2varlen <= MAX_COINBASE_TX_LEN
+		       && "INTERNAL ERROR: coinbase tx length exceeded. FIXME!");
+		wb->coinb2len = (int)endpos;
+		assert(((size_t)wb->coinb2len) == endpos && wb->coinb2len > -1 && "INTERNAL ERROR: integer overflow");
+		uint8_t *compact_size_buf = alloca(9);
+		const int nb = write_compact_size(compact_size_buf, num_txns);
+		if (unlikely(nb > compact_size_reserved)) {
+			quit(1, "INTERNAL ERROR: Got %lu txs in coinbase! This is unsupported!", num_txns);
+		} else if (nb == compact_size_reserved) {
+			// >= 253 txns. this is what we assumed as worst-case and we don't need to realign the data.
+			memcpy(wb->coinb2bin + compact_size_pos, compact_size_buf, nb);
+		} else if (nb == 1) {
+			// < 253 txns, we need to slide the tx data blob backwards by 2 bytes.
+			const int blob_size = wb->coinb2len - first_tx_pos;
+			const int ndiff = compact_size_reserved - nb;
+			assert(blob_size >= 0);
+			assert(ndiff == first_tx_pos - (compact_size_pos + 1));
+			if (blob_size) {
+				memmove(wb->coinb2bin + compact_size_pos + 1, wb->coinb2bin + first_tx_pos, blob_size);
+				endpos -= ndiff;
+				wb->coinb2len -= ndiff;
+				LOGDEBUG("Coinb2 moved %d-byte blob backwards by %d bytes, endpos now: %d",
+				         blob_size, ndiff, wb->coinb2len);
+			}
+			first_tx_pos -= ndiff;
+			wb->coinb2bin[compact_size_pos] = *compact_size_buf; // write size byte
+		} else {
+			// this should never happen.
+			quit(1, "Unexpected compact_size number of bytes!");
+		}
+		LOGDEBUG("num_txs: %lu", num_txns);
 	}
 	wb->coinb2len += 4; // Blank lock
 
@@ -990,6 +1111,7 @@ static void generate_coinbase(const pool_t *ckp, workbase_t *wb)
 		 workpadding);
 	LOGDEBUG("Header: %s", header);
 	hex2bin(wb->headerbin, header, 112);
+	LOGDEBUG("%s: took %0.6f secs", __FUNCTION__, (time_micros()-t0)/1e6);
 }
 
 static void stratum_broadcast_update(sdata_t *sdata, const workbase_t *wb, bool clean);
@@ -1338,6 +1460,7 @@ static void add_base(pool_t *ckp, sdata_t *sdata, workbase_t *wb, bool *new_bloc
 
 	ts_realtime(&wb->gentime);
 	wb->network_diff = diff_from_nbits(wb->headerbin + 72);
+	LOGDEBUG("gbt network diff: %1.3lf", wb->network_diff);
 	if (!ckp->proxy) {
 		pool_stats_t *stats = &ckp_sdata->stats;
 		double reward = wb->coinbasevalue;
@@ -1369,7 +1492,11 @@ static void add_base(pool_t *ckp, sdata_t *sdata, workbase_t *wb, bool *new_bloc
 		memcpy(sdata->lasthash, wb->prevhash, 65);
 		hex2bin(bin, sdata->lasthash, 32);
 		swap_256(swap, bin);
-		__bin2hex(sdata->lastswaphash, swap, 32);
+		{
+			mutex_lock(&sdata->last_hash_lock);
+			__bin2hex(sdata->lastswaphash, swap, 32);
+			mutex_unlock(&sdata->last_hash_lock);
+		}
 		sdata->blockchange_id = wb->id;
 	}
 	if (*new_block && ckp->logshares) {
@@ -1378,7 +1505,7 @@ static void add_base(pool_t *ckp, sdata_t *sdata, workbase_t *wb, bool *new_bloc
 		if (unlikely(ret && errno != EEXIST))
 			LOGERR("Failed to create log directory %s", wb->logdir);
 	}
-	sprintf(wb->idstring, "%016lx", wb->id);
+	sprintf(wb->idstring, "%016"PRIx64, wb->id);
 	if (ckp->logshares)
 		sprintf(wb->logdir, "%s%08x/%s", ckp->logdir, wb->height, wb->idstring);
 
@@ -1845,10 +1972,17 @@ static void block_update(pool_t *ckp, int *prio)
 	bool ret = false;
 	txntable_t *txns;
 	workbase_t *wb;
+	time_t update_time;
+
+	{
+		mutex_lock(&sdata->update_time_lock);
+		update_time = sdata->update_time;
+		mutex_unlock(&sdata->update_time_lock);
+	}
 
 	/* Skip update if we're getting stacked low priority updates too close
 	 * together. */
-	if (*prio < GEN_PRIORITY && time(NULL) < sdata->update_time + (ckp->update_interval / 2) &&
+	if (*prio < GEN_PRIORITY && time(NULL) < update_time + (ckp->update_interval / 2) &&
 	    sdata->current_workbase) {
 		ret = true;
 		goto out;
@@ -1883,7 +2017,12 @@ retry:
 	LOGINFO("Broadcast updated stratum base");
 
 	if (new_block) {
-		LOGNOTICE("Block hash changed to %s", sdata->lastswaphash);
+#define DECLARE_GET_LASTSWAPHASH_THREADSAFE(varname, sdata) \
+		mutex_lock(&sdata->last_hash_lock); \
+		const char * const varname = strdupa(sdata->lastswaphash); \
+		mutex_unlock(&sdata->last_hash_lock)
+		DECLARE_GET_LASTSWAPHASH_THREADSAFE(lastswaphash, sdata);
+		LOGNOTICE("Block hash changed to %s", lastswaphash);
 		/* Checking existence of DL list lockless but not trying to
 		 * reference data */
 		if (sdata->stats.unconfirmed)
@@ -1895,9 +2034,12 @@ retry:
 		update_txns(ckp, sdata, txns, true);
 	/* Reset the update time to avoid stacked low priority notifies. Bring
 	 * forward the next notify in case of a new block. */
+	mutex_lock(&sdata->update_time_lock);
 	sdata->update_time = time(NULL);
 	if (new_block)
 		sdata->update_time -= ckp->update_interval / 2;
+	update_time = sdata->update_time;
+	mutex_unlock(&sdata->update_time_lock);
 out:
 
 	cksem_post(&sdata->update_sem);
@@ -2306,8 +2448,10 @@ static void add_node_base(pool_t *ckp, json_t *val, bool trusted, int64_t client
 	else
 		add_base(ckp, sdata, wb, &new_block);
 
-	if (new_block)
-		LOGNOTICE("Block hash changed to %s", sdata->lastswaphash);
+	if (new_block) {
+		DECLARE_GET_LASTSWAPHASH_THREADSAFE(lastswaphash, sdata);
+		LOGNOTICE("Block hash changed to %s", lastswaphash);
+	}
 }
 
 /* Calculate share diff and fill in hash and swap. Need to hold workbase read count */
@@ -2623,7 +2767,7 @@ static void submit_node_block(pool_t *ckp, sdata_t *sdata, json_t *val)
 
 	/* Get parameters if upstream pool supports them with new format */
 	json_get_string(&coinbasehex, val, "coinbasehex");
-	json_get_int(&cblen, val, "cblen");
+	json_get_int(&cblen, val, "cblen"); // TODO: enforce 1MB coinbase tx length here?
 	json_get_string(&swaphex, val, "swaphex");
 	if (coinbasehex && cblen && swaphex) {
 		uchar hash1[32];
@@ -2644,6 +2788,8 @@ static void submit_node_block(pool_t *ckp, sdata_t *sdata, json_t *val)
 		share_diff(coinbase, enonce1bin, wb, nonce2, ntime32, version_mask, nonce, hash, swap, &cblen);
 	}
 
+	// TODO: Enforce 32MB block size limit here?
+
 	/* Now we have enough to assemble a block */
 	gbt_block = process_block(wb, coinbase, cblen, swap, hash, flip32, blockhash);
 	ret = local_block_submit(ckp, gbt_block, flip32, wb->height);
@@ -2655,7 +2801,7 @@ static void submit_node_block(pool_t *ckp, sdata_t *sdata, json_t *val)
 			 "workinfoid", wb->id,
 			 "enonce1", enonce1,
 			 "nonce2", nonce2,
-		         "version_mask", version_mask,
+			 "version_mask", version_mask,
 			 "nonce", nonce,
 			 "reward", wb->coinbasevalue,
 			 "diff", diff,
@@ -2818,9 +2964,11 @@ static sdata_t *duplicate_sdata(const sdata_t *sdata)
 	dsdata->ckp = sdata->ckp;
 
 	/* Copy the transaction binaries for workbase creation */
-	memcpy(dsdata->txnbin, sdata->txnbin, 48); // FIXME: why are we not copying txnlen? -Calin
+	memcpy(dsdata->txnbin, sdata->txnbin, 48);
+	dsdata->txnlen = sdata->txnlen;
 	for (int i = 0; i < DONATION_NUM_ADDRESSES; ++i) {
-		memcpy(dsdata->donation_data[i].txnbin, sdata->donation_data[i].txnbin, 48); // FIXME: why are we not copying txnlen? -Calin
+		memcpy(dsdata->donation_data[i].txnbin, sdata->donation_data[i].txnbin, 48);
+		dsdata->donation_data[i].txnlen = sdata->donation_data[i].txnlen;
 	}
 
 	/* Use the same work queues for all subproxies */
@@ -2835,6 +2983,11 @@ static sdata_t *duplicate_sdata(const sdata_t *sdata)
 	cklock_init(&dsdata->workbase_lock);
 	cksem_init(&dsdata->update_sem);
 	cksem_post(&dsdata->update_sem);
+
+	// Added by Calin. Unclear if this is needed for this proxy sdata.
+	mutex_init(&dsdata->update_time_lock);
+	mutex_init(&dsdata->last_hash_lock);
+
 	return dsdata;
 }
 
@@ -3489,10 +3642,11 @@ static void update_notify(pool_t *ckp, const char *cmd)
 
 	add_base(ckp, dsdata, wb, &new_block);
 	if (new_block) {
+		DECLARE_GET_LASTSWAPHASH_THREADSAFE(lastswaphash, dsdata);
 		if (subid)
-			LOGINFO("Block hash on proxy %d:%d changed to %s", id, subid, dsdata->lastswaphash);
+			LOGINFO("Block hash on proxy %d:%d changed to %s", id, subid, lastswaphash);
 		else
-			LOGNOTICE("Block hash on proxy %d changed to %s", id, dsdata->lastswaphash);
+			LOGNOTICE("Block hash on proxy %d changed to %s", id, lastswaphash);
 	}
 
 	check_proxy(sdata, proxy);
@@ -3609,6 +3763,10 @@ static void free_proxy(proxy_t *proxy)
 			clear_workbase(wb);
 		}
 		ck_wunlock(&dsdata->workbase_lock);
+
+		// Added by Calin. Unclear if this lock is even necessary for the fake proxy stratifier data.
+		mutex_destroy(&dsdata->last_hash_lock);
+		mutex_destroy(&dsdata->update_time_lock);
 	}
 
 	free(proxy->sdata);
@@ -4946,10 +5104,14 @@ retry:
 	}
 
 	do {
-		time_t end_t;
-
+		time_t end_t, update_time;
+		{
+			mutex_lock(&sdata->update_time_lock);
+			update_time = sdata->update_time;
+			mutex_unlock(&sdata->update_time_lock);
+		}
 		end_t = time(NULL);
-		if (end_t - sdata->update_time >= ckp->update_interval) {
+		if (end_t - update_time >= ckp->update_interval) {
 			if (!ckp->proxy) {
 				LOGDEBUG("%ds elapsed in strat_loop, updating gbt base",
 					 ckp->update_interval);
@@ -5109,11 +5271,13 @@ static void *blockupdate(void *arg)
 			case GETBEST_NOTIFY:
 				cksleep_ms(5000);
 				break;
-			case GETBEST_SUCCESS:
-				if (strcmp(hash, sdata->lastswaphash)) {
+			case GETBEST_SUCCESS: {
+				DECLARE_GET_LASTSWAPHASH_THREADSAFE(lastswaphash, sdata);
+				if (strcmp(hash, lastswaphash)) {
 					update_base(sdata, GEN_PRIORITY);
 					break;
 				}
+			}
 			case GETBEST_FAILED:
 			default:
 				cksleep_ms(ckp->blockpoll);
@@ -5390,7 +5554,7 @@ static json_t *parse_subscribe(stratum_instance_t *client, const int64_t client_
 		}
 		if (!ckp->proxy && session_id && !subclient(client_id)) {
 			if ((client->enonce1_64 = disconnected_sessionid_exists(sdata, session_id, client_id))) {
-				sprintf(client->enonce1, "%016lx", client->enonce1_64);
+				sprintf(client->enonce1, "%016"PRIx64, client->enonce1_64);
 				old_match = true;
 
 				ck_rlock(&ckp_sdata->workbase_lock);
@@ -5438,10 +5602,10 @@ static json_t *parse_subscribe(stratum_instance_t *client, const int64_t client_
 			client->reject = 3;
 			return json_string("proxy full");
 		}
-		LOGINFO("Set new subscription %s to new enonce1 %lx string %s", client->identity,
+		LOGINFO("Set new subscription %s to new enonce1 %"PRIx64" string %s", client->identity,
 			client->enonce1_64, client->enonce1);
 	} else {
-		LOGINFO("Set new subscription %s to old matched enonce1 %lx string %s",
+		LOGINFO("Set new subscription %s to old matched enonce1 %"PRIx64" string %s",
 			client->identity, client->enonce1_64, client->enonce1);
 	}
 
@@ -5704,11 +5868,11 @@ static void read_userstats(pool_t *ckp, sdata_t *sdata, int tvsec_diff)
 		sdata->stats.rolling_herp = 0.1;
 	if (!sdata->stats.rolling_lns)
 		sdata->stats.rolling_lns = 0.1;
-	/* Start out with more than enough space */
+	/* Note this value isn't used apart from advisory information -- it's just an upper-bound estimate. */
 	sdata->stats.cbspace = users * CBGENLEN;
 
 	if (likely(users))
-		LOGWARNING("Loaded %d users and %d workers", users, workers);
+		LOGWARNING("Loaded %d users and %d workers; est. cbspace %d bytes", users, workers, sdata->stats.cbspace);
 }
 
 #define DEFAULT_AUTH_BACKOFF	(3)  /* Set initial backoff to 3 seconds */
@@ -6447,7 +6611,8 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
 	if (likely(diff < sdata->current_workbase->network_diff * 0.999))
 		return;
 
-	LOGWARNING("Possible %sblock solve diff %lf !", stale ? "stale share " : "", diff);
+	LOGWARNING("Possible %sblock solve diff %lf (network diff: %lf) !", stale ? "stale share " : "", diff,
+	           sdata->current_workbase->network_diff);
 	/* Can't submit a block in proxy mode without the transactions */
 	if (!ckp->node && wb->proxy)
 		return;
@@ -6710,7 +6875,7 @@ static json_t *parse_submit(stratum_instance_t *client, json_t *json_msg,
 		*err_val = JSON_ERR(err);
 		goto out;
 	}
-	sscanf(job_id, "%lx", &id);
+	sscanf(job_id, "%"PRIx64, &id);
 	sscanf(ntime, "%x", &ntime32);
 
 	share = true;
@@ -7351,7 +7516,7 @@ static void parse_subscribe_result(stratum_instance_t *client, json_t *val)
 	len = strlen(client->enonce1) / 2;
 	hex2bin(client->enonce1bin, client->enonce1, len);
 	memcpy(&client->enonce1_64, client->enonce1bin, 8);
-	LOGINFO("Client %s got enonce1 %lx string %s", client->identity, client->enonce1_64, client->enonce1);
+	LOGINFO("Client %s got enonce1 %"PRIx64" string %s", client->identity, client->enonce1_64, client->enonce1);
 }
 
 static void parse_authorise_result(pool_t *ckp, sdata_t *sdata, stratum_instance_t *client,
@@ -8502,9 +8667,9 @@ static void send_transactions(pool_t *ckp, json_params_t *jp)
 		 * transactions :) . Support both forms of encoding the
 		 * request in method name and as a parameter. */
 		if (params && strlen(params) > 0)
-			sscanf(params, "%lx", &job_id);
+			sscanf(params, "%"PRIx64, &job_id);
 		else
-			sscanf(msg, "mining.get_transactions(%lx", &job_id);
+			sscanf(msg, "mining.get_transactions(%"PRIx64, &job_id);
 		txns = transactions_by_jobid(sdata, job_id);
 		if (txns != -1) {
 			json_set_int(val, "result", txns);
@@ -8537,7 +8702,7 @@ static void send_transactions(pool_t *ckp, json_params_t *jp)
 		json_set_string(val, "error", "Invalid params");
 		goto out_send;
 	}
-	sscanf(params, "%lx", &job_id);
+	sscanf(params, "%"PRIx64, &job_id);
 	hashes = txnhashes_by_jobid(sdata, job_id);
 	if (hashes) {
 		json_object_set_new_nocheck(val, "result", hashes);
@@ -8872,8 +9037,7 @@ static void *statsupdate(void *arg)
 		char suffix1[16], suffix5[16], suffix15[16], suffix60[16], cdfield[64];
 		char suffix360[16], suffix1440[16], suffix10080[16];
 		char pcstring[16];
-		int remote_users = 0, remote_workers = 0, idle_workers = 0,
-			cbspace = 0, payouts = 0;
+		int remote_users = 0, remote_workers = 0, idle_workers = 0, cbspace = 0, payouts = 0;
 		log_entry_t *log_entries = NULL, *miner_entries = NULL;
 		char_entry_t *char_list = NULL;
 		long double numer, herp, lns;
@@ -9155,8 +9319,7 @@ static void *statsupdate(void *arg)
 
 		calc_user_paygens(sdata);
 
-		LOGINFO("Leaving %d bytes free in coinbase for user txn generation",
-			cbspace);
+		LOGINFO("Estimated %d bytes will be needed in coinbase for user payouts", cbspace);
 
 		mutex_lock(&sdata->stats_lock);
 		stats->cbspace = cbspace;
@@ -9464,7 +9627,12 @@ static void read_poolstats(pool_t *ckp, int *tvsec_diff)
 	}
 	tv_time(&now);
 	last.tv_sec = 0;
-	json_get_int64(&last.tv_sec, val, "lastupdate");
+	if (sizeof(time_t) == 8) // would be nice to do this at compile-time?
+		json_get_int64((int64_t *)&last.tv_sec, val, "lastupdate");
+	else if (sizeof(time_t) == 4)
+		json_get_int((int *)&last.tv_sec, val, "lastupdate");
+	else
+		quit(1, "Expected time_t to be 4 or 8 bytes, not %d. Unknown platform.", (int)sizeof(time_t));
 	json_decref(val);
 	LOGINFO("Successfully read pool pstats: %s", pstats);
 
@@ -9679,6 +9847,9 @@ void *stratifier(void *arg)
 		create_pthread(&pth_statsupdate, statsupdate, ckp);
 
 	mutex_init(&sdata->share_lock);
+
+	mutex_init(&sdata->update_time_lock);
+	mutex_init(&sdata->last_hash_lock);
 
 	ckp->stratifier_ready = true;
 	LOGWARNING("%s stratifier ready", ckp->name);

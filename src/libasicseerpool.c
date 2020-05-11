@@ -46,6 +46,8 @@
 #define UNIX_PATH_MAX 108
 #endif
 
+const int *global_loglevel_ptr = NULL; /// used by macros if set
+
 /* We use a weak function as a simple printf within the library that can be
  * overridden by however the outside executable wishes to do its logging. */
 void __attribute__((weak)) logmsg(int __maybe_unused loglevel, const char *fmt, ...)
@@ -1461,7 +1463,7 @@ void *_ckzrealloc(void *oldbuf, size_t len, bool zeromem, const char *file, cons
 		}
 		cksleep_ms(backoff);
 		backoff <<= 1;
-		if (unlikely(!backoff))
+		if (unlikely(backoff <= 0))
 			// overflow past end, start over -- this is here for correctness but should never
 			// happen in practice as it indicates we have been sleeping for 2 million seconds
 			backoff = 1;
@@ -1858,7 +1860,8 @@ int ser_number(uchar *s, int32_t val)
 		len = 3;
 	else
 		len = 4;
-	*i32 = htole32(val);
+	const int32_t tmp = htole32(val);
+	memcpy(i32, &tmp, len);
 	s[0] = len++;
 	return len;
 }
@@ -1873,6 +1876,35 @@ int get_sernumber(uchar *s)
 		return 0;
 	memcpy(&val, &s[1], len);
 	return le32toh(val);
+}
+
+int write_compact_size(void *dest, size_t nSize)
+{
+	uint8_t *buf = (uint8_t *)dest;
+	if (nSize < 253) {
+		*buf = (uint8_t)nSize;
+		return 1;
+	}
+	if (nSize <= UINT16_MAX) {
+		*buf++ = 0xfd;
+		// avoid unaligned access
+		const uint16_t datum = htole16((uint16_t)nSize);
+		memcpy(buf, &datum, 2);
+		return 3;
+	}
+	if (nSize <= UINT32_MAX) {
+		*buf++ = 0xfe;
+		// avoid unaligned access
+		const uint32_t datum = htole32((uint32_t)nSize);
+		memcpy(buf, &datum, 4);
+		return 5;
+	}
+	// 64-bit (8 byte) .. unlikely.
+	*buf++ = 0xff;
+	// avoid unaligned access
+	const uint64_t datum = htole64((uint64_t)nSize);
+	memcpy(buf, &datum, 8);
+	return 9;
 }
 
 /* For testing a le encoded 256 byte hash against a target */
@@ -1957,6 +1989,14 @@ void ts_realtime(ts_t *ts)
 {
 	clock_gettime(CLOCK_REALTIME, ts);
 }
+
+int64_t time_micros(void)
+{
+	ts_t ts;
+	ts_realtime(&ts);
+	return ts.tv_sec * 1000000L + ts.tv_nsec / 1000L;
+}
+
 
 void cksleep_prepare_r(ts_t *ts)
 {
@@ -2163,8 +2203,8 @@ double diff_from_target(uchar *target)
 
 	d64 = truediffone;
 	dcut64 = le256todouble(target);
-	if (unlikely(!dcut64))
-		dcut64 = 1;
+	if (unlikely(dcut64 <= 0.0))
+		dcut64 = 1.;
 	return d64 / dcut64;
 }
 
@@ -2179,8 +2219,8 @@ double diff_from_nbits(char *nbits)
 
 	pow = nbits[0];
 	powdiff = (8 * (0x1d - 3)) - (8 * (pow - 3));
-	if (powdiff < 8) // testnet only
-		powdiff = 8;
+	if (powdiff < 0) // testnet only
+		powdiff = 0;
 	diff32 = be32toh(*((uint32_t *)nbits)) & 0x00FFFFFF;
 	numerator = 0xFFFFULL << powdiff;
 
