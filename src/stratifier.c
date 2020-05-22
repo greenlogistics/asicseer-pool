@@ -24,6 +24,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <libgen.h>
+#include <zmq.h>
 
 #include <strbuffer.h> // from jansson, for strbuffer_t
 
@@ -55,8 +56,8 @@ static const double nonces = 4294967296;
 #define DERP_DUST	5460 /* Minimum DERP to get onto payout list */
 #define PAYOUT_DUST	DUST_LIMIT_SATS /* Minimum payout not dust -- currently 546 sats */
 #define DERP_SPACE	1000 /* Minimum derp to warrant leaving coinbase space */
-#define PAYOUT_USERS    1000 /* Number of top users that get reward each block */
-#define PAYOUT_REWARDS  1500 /* Max number of users rewarded each block */
+#define PAYOUT_USERS    100 /* Number of top users that get reward each block */
+#define PAYOUT_REWARDS  150 /* Max number of users rewarded each block */
 #define SATOSHIS	100000000 /* Satoshi to a BTC */
 #if PAYOUT_REWARDS * CBGENLEN > MAX_CB_SPACE
 #error Please set PAYOUT_REWARDS to fit inside a coinbase tx (MAX_CB_SPACE)!
@@ -646,25 +647,18 @@ static int postponed_sort(generation_t *a, generation_t *b)
 
 typedef struct {
     strbuffer_t buffer;
-    size_t num_txns;
-} txns_buffer_t;
+    size_t num_outs;
+} cb1_buffer_t;
 
-static void txns_buffer_give(txns_buffer_t *t, void **buf, size_t pos, size_t capacity)
+static void cb1_buffer_init(cb1_buffer_t *t, size_t capacity)
 {
-    assert(t);
-    assert(buf && *buf);
-    assert(capacity);
-    assert(pos <= capacity);
-
     memset(t, 0, sizeof(*t));
-    t->buffer.data = *buf;
-    *buf = NULL;
-    t->buffer.length = pos;
+    capacity = MAX(capacity, 1UL);
+    t->buffer.data = ckzalloc(capacity);
     t->buffer.size = capacity;
-    t->num_txns = 0;
 }
 
-static void txns_buffer_take(txns_buffer_t *t, void **bufptr, size_t *pos, size_t *capacity)
+static void cb1_buffer_take(cb1_buffer_t *t, void **bufptr, size_t *pos, size_t *capacity)
 {
     assert(bufptr);
     if (pos) *pos = t->buffer.length;
@@ -672,11 +666,11 @@ static void txns_buffer_take(txns_buffer_t *t, void **bufptr, size_t *pos, size_
     *bufptr = strbuffer_steal_value(&t->buffer);
 }
 
-/// Add an amount[8 bytes],scriptbinlen[1 byte],scriptbin[txnlen bytes] to txns_buffer_t `buf`.
+/// Add an amount[8 bytes],scriptbinlen[1 byte],scriptbin[txnlen bytes] to cb1_buffer_t `buf`.
 /// Returns an index into the buffer where the amount data begins on success.
 /// On failure (which is unlikely) this function will call quit().  So this always returns on success.
 /// IMPORTANT: txnlen must be <253 bytes otherwise this will always fail.
-static size_t _add_txnbin(txns_buffer_t *buf, uint64_t amount, const void *txnbin, size_t txnlen)
+static size_t _add_txnbin(cb1_buffer_t *buf, uint64_t amount, const void *txnbin, size_t txnlen)
 {
     const size_t size = 8 + 1 + txnlen;
     uint8_t *tmp = alloca(size);
@@ -693,18 +687,18 @@ static size_t _add_txnbin(txns_buffer_t *buf, uint64_t amount, const void *txnbi
              __FUNCTION__, buf->buffer.size);
         return 0; // not reached
     }
-    assert(++buf->num_txns && "INTERNAL ERROR: integer overflow for txns_buffer_t::num_txns!");
+    assert(++buf->num_outs && "INTERNAL ERROR: integer overflow for cb1_buffer_t::num_outs!");
     return ret;
 }
 
-/* Add generation transactions to the transaction buffer `txns` for each user, return any spare
+/* Add generation transactions to the coinbase buffer `cb_buf` for each user, return any spare
  * change. Note that the return value may be negative if users had fee discounts,
  * in which case there is "negative" change and the pool output must deduct this amount
  * from its own output (that is, add the negative to the pool output value).  This negative
  * output will never result in the pf64 (fee) value becoming smaller than the dust limit,
  * however -- so the pool may safely just add whatever the negative return value is
  * (or add the positive return value which will always be >=546 sats).*/
-static int64_t add_user_generation(sdata_t *sdata, workbase_t *wb, txns_buffer_t *txns, uint64_t g64, uint64_t pf64)
+static int64_t add_user_generation(sdata_t *sdata, workbase_t *wb, cb1_buffer_t *cb_buf, uint64_t g64, uint64_t pf64)
 {
     json_t * const payout = json_object(),
            * const payout_entries = json_object(),
@@ -780,8 +774,27 @@ static int64_t add_user_generation(sdata_t *sdata, workbase_t *wb, txns_buffer_t
         else
             LOGINFO("User %s reward %1.8f", user->username, total_reward / (double)SATOSHIS);
 
+#define TEST_FILL_CB 0 /* leave as 0 unless testing large CB payouts */
+#if TEST_FILL_CB > 1
+        {
+            // this is for testing large payout tx's.
+            int N = TEST_FILL_CB;
+            uint64_t per_out = total_reward / TEST_FILL_CB, rem = total_reward % TEST_FILL_CB;
+            if (per_out < PAYOUT_DUST) {
+                per_out = total_reward;
+                N = 1;
+                rem = 0;
+            }
+            for (int i = 0; i < N; ++i) {
+                const uint64_t rew = per_out + ( i+1 == N ? rem : 0 );
+                amt_pos = _add_txnbin(cb_buf, rew, user->txnbin, user->txnlen);
+                LOGDEBUG("User %s outp %d reward %"PRIu64, user->username, 1 + i + payouts, rew);
+            }
+        }
+#else
         /* Add the user's coinbase reward, using the cached cscript */
-        amt_pos = _add_txnbin(txns, total_reward, user->txnbin, user->txnlen);
+        amt_pos = _add_txnbin(cb_buf, total_reward, user->txnbin, user->txnlen);
+#endif
 
         if (!pf64 && total_reward > max_payee.reward) {
             // remember this as the largest payee in case we need to give them leftover dust
@@ -801,7 +814,7 @@ static int64_t add_user_generation(sdata_t *sdata, workbase_t *wb, txns_buffer_t
         uint64_t newreward = max_payee.reward + total;
         newreward = htole64(newreward);
         // update coinbase binary, avoiding unaligned access issues by doing a byte copy
-        memcpy(txns->buffer.value + max_payee.amt_pos, &newreward, sizeof(newreward));
+        memcpy(cb_buf->buffer.value + max_payee.amt_pos, &newreward, sizeof(newreward));
         total = 0;
         json_set_double(payout_entries, username, newreward / (double)SATOSHIS); // update json
     }
@@ -820,138 +833,20 @@ skip:
     return total;
 }
 
-/// This is called in a serialized context (form a ckmsgq)
-static void generate_coinbase(const pool_t *ckp, workbase_t *wb)
+static void add_coinbase_payouts(const pool_t *ckp, workbase_t *wb, cb1_buffer_t *cb1_buf)
 {
-    const int64_t t0 = time_micros();
-    uint64_t g64 = 0, f64 = 0, pf64 = 0, df64 = 0;
+    uint64_t g64, f64, pf64, df64;
+    int64_t c64;
     sdata_t *sdata = ckp->sdata;
-    int len, ofs = 0;
-    char header[228];
-    txns_buffer_t txns_buf;
     size_t pool_amt_pos = 0;
     bool pool_has_amt = false;
-
-    /* Set fixed length coinb1 arrays to be more than enough */
-    wb->coinb1 = ckzalloc(256);
-    wb->coinb1bin = ckzalloc(128);
-
-    /* Strings in wb should have been zero memset prior. Generate binary
-     * templates first, then convert to hex */
-    memcpy(wb->coinb1bin, scriptsig_header_bin, 41);
-    ofs += 41; // Fixed header length;
-
-    ofs++; // Script length is filled in at the end @wb->coinb1bin[41];
-
-    /* Put block height at start of template (consensus rule) */
-    len = ser_number(wb->coinb1bin + ofs, wb->height);
-    ofs += len;
-
-    // just write the current time in micros directly, in host byte order
-    len = sizeof(t0);
-    memcpy(wb->coinb1bin + ofs, &t0, len);
-    ofs += len;
-
-    // Make room for the nonce data (usually 12 bytes). this will come from the client
-    // when they submit their shares.
-    wb->enonce1varlen = ckp->nonce1length;
-    wb->enonce2varlen = ckp->nonce2length;
-    // save nonce length to scriptsig
-    wb->coinb1bin[ofs++] = wb->enonce1varlen + wb->enonce2varlen;
-
-    wb->coinb1len = ofs;
-
-    len = wb->coinb1len - 41;
-
-    len += wb->enonce1varlen;
-    len += wb->enonce2varlen;
-
-    static const size_t COINB2_INITIAL_CAPACITY = 512;
-
-    wb->coinb2bin = ckzalloc(COINB2_INITIAL_CAPACITY);
-    wb->coinb2len = 0;
-    {
-        // ensure that what follows is <=100 bytes total for the scriptsig otherwise
-        // block will be rejected as per BCH consensus rules.
-        int spaceLeft = MAX_COINBASE_SCRIPTSIG_LEN - len + 1; // <-- +1 here is because 'len' accounts for the scriptsig length byte, which is not counted towards the 100-byte total
-        char cbprefix[] = "/" HARDCODED_COINBASE_PREFIX_STR " ";
-        static const char cbsuffix[] = HARDCODED_COINBASE_SUFFIX_STR "/";
-        static const int cbsuffix_len = sizeof(cbsuffix)-1;
-        int cbprefix_len = sizeof(cbprefix)-1;
-        if (!*HARDCODED_COINBASE_PREFIX_STR && cbprefix_len) {
-            // prefix string is empty, cut off the hard-coded trailing space
-            cbprefix[--cbprefix_len] = 0;
-        }
-        int n = MIN(cbprefix_len, spaceLeft);
-        if (n > 0) {
-            memcpy(wb->coinb2bin + wb->coinb2len, cbprefix, n);
-            wb->coinb2len += n;
-            spaceLeft -= n;
-        }
-        {
-            // Add user sig text. Note: we limit its size to what's left over after accounting for the
-            // prefix and suffix strings.
-            const bool hasSuffix = *HARDCODED_COINBASE_SUFFIX_STR;
-            const int sigSpace = spaceLeft - cbsuffix_len - (hasSuffix ? 1 : 0);
-            if (ckp->bchsig && sigSpace > 0) {
-                const int siglen = strlen(ckp->bchsig);
-                n = MIN(siglen, sigSpace);
-
-                LOGDEBUG("Len %d sig: \"%s\"", n, ckp->bchsig);
-                if (n > 0) {
-                    memcpy(wb->coinb2bin + wb->coinb2len, ckp->bchsig, n);
-                    wb->coinb2len += n;
-                    spaceLeft -= n;
-                    if (hasSuffix && spaceLeft > 0) {
-                        wb->coinb2bin[wb->coinb2len++] = ' '; // add a space for non-empty suffix
-                        --spaceLeft;
-                    }
-                }
-            }
-        }
-        n = MIN(cbsuffix_len, spaceLeft);
-        if (n > 0) {
-            memcpy(wb->coinb2bin + wb->coinb2len, cbsuffix, n);
-            wb->coinb2len += n;
-            spaceLeft -= n;
-        }
-        LOGDEBUG("CB text: \"%.*s\"", wb->coinb2len, wb->coinb2bin);
-    }
-    len += wb->coinb2len;
-
-    wb->coinb1bin[41] = (uchar)(len - 1); /* Set the length now - always 1 byte (length is always <=100) */
-    if (unlikely(wb->coinb1bin[41] > MAX_COINBASE_SCRIPTSIG_LEN)) {
-        // Paranoia: This should never happen. But if it does, we need to quit ASAP since mining will break.
-        // User may need to adjust config and/or contact devs.
-        quit(1, "INTERNAL ERROR: Max coinbase scriptsig length is %d, but we generated a scriptsig of "
-             "%d bytes.  File: %s, line: %d", (int)MAX_COINBASE_SCRIPTSIG_LEN, (int)(wb->coinb1bin[41]),
-             __FILE__, (int)__LINE__);
-    }
-    __bin2hex(wb->coinb1, wb->coinb1bin, wb->coinb1len);
-    LOGDEBUG("Coinb1: %s", wb->coinb1);
-    /* Coinbase 1 complete */
-
-    memcpy(wb->coinb2bin + wb->coinb2len, "\xff\xff\xff\xff", 4); // sequence
-    wb->coinb2len += 4;
-
-    // at this pint wb->coinb2bin[wb->coinb2len] points to the tx.vout length field (compact size).
-    // reserve 3 bytes for this field.  Common case is we will have to move the data back by 2 bytes, however.
-    const int compact_size_pos = wb->coinb2len;
-    static const int compact_size_reserved = 3;
-    wb->coinb2len += compact_size_reserved; // point past the reserved space.
-    int first_tx_pos = wb->coinb2len;
-
-    // Now we "give" wb->coinb2bin to the txns_buffer, which may end up modifying the pointed-to buffer
-    // address as it grows the buffer.
-    txns_buffer_give(&txns_buf, (void **)&wb->coinb2bin, wb->coinb2len, COINB2_INITIAL_CAPACITY);
-    // NOTE: wb->coinb2bin will be temporarily NULL now until we "take" the buffer back.
 
     // Generation value
     g64 = wb->coinbasevalue; // generation (reward)
     f64 = round(g64 * (ckp->pool_fee/100.0)); // pool fee gross (including dev donation)
     pf64 = f64; // pool fee net (minus dev donation), starts off as f64 initially but may be decreased below
     df64 = 0; // total dev donations (10% of f64 * num_devs), 0 initially, may be increased below
-    int64_t c64 = 0; // leftover change/dust, 0 initially, may increase below, or go below 0 if pool fee was credited back to pool discount users (see add_user_generation)
+    c64 = 0; // leftover change/dust, 0 initially, may increase below, or go below 0 if pool fee was credited back to pool discount users (see add_user_generation)
 
     if (CKP_STANDALONE(ckp)) {
         // payout to miners directly in SPLNS mode (also pay out hard-coded dev donations)
@@ -968,7 +863,7 @@ static void generate_coinbase(const pool_t *ckp, workbase_t *wb)
             pf64 = f64 - df64;
 
             // add pool net fee
-            pool_amt_pos = _add_txnbin(&txns_buf, pf64, sdata->txnbin, sdata->txnlen);
+            pool_amt_pos = _add_txnbin(cb1_buf, pf64, sdata->txnbin, sdata->txnlen);
             pool_has_amt = true;
             const double fee = pf64 / (double)SATOSHIS;
             LOGDEBUG("%1.8f pool fee to pool address: %s", fee, ckp->bchaddress);
@@ -978,7 +873,7 @@ static void generate_coinbase(const pool_t *ckp, workbase_t *wb)
                 for (int i = 0; i < DONATION_NUM_ADDRESSES && leftover > 0; ++i) {
                     if (sdata->donation_data[i].txnlen && ckp->dev_donations[i].valid) {
                         // good address
-                        _add_txnbin(&txns_buf, don_each, sdata->donation_data[i].txnbin, sdata->donation_data[i].txnlen);
+                        _add_txnbin(cb1_buf, don_each, sdata->donation_data[i].txnbin, sdata->donation_data[i].txnlen);
                         leftover -= (int64_t)don_each;
                         const double d = don_each / (double)SATOSHIS;
                         LOGDEBUG("%f dev donation to address: %s", d, ckp->dev_donations[i].address);
@@ -996,7 +891,7 @@ static void generate_coinbase(const pool_t *ckp, workbase_t *wb)
         uint64_t le_amt = amt; \
         le_amt = htole64(le_amt); \
         assert(pool_has_amt); \
-        memcpy(txns_buf.buffer.value + pool_amt_pos, &le_amt, sizeof(le_amt)); \
+        memcpy(cb1_buf->buffer.value + pool_amt_pos, &le_amt, sizeof(le_amt)); \
     } while(0)
                 SET_POOL_AMT(pf64);
                 LOGDEBUG("%f leftover from dev donations back to pool address: %s", d, ckp->bchaddress);
@@ -1011,7 +906,7 @@ static void generate_coinbase(const pool_t *ckp, workbase_t *wb)
 
         assert(!pf64 || pool_has_amt); // if there is a pool fee (pf64), then there must have been a pool payout generated above.
 
-        c64 = add_user_generation(sdata, wb, &txns_buf, g64 - f64, pf64); // add miner payouts, minus total fee
+        c64 = add_user_generation(sdata, wb, cb1_buf, g64 - f64, pf64); // add miner payouts, minus total fee
 
         /* Add any change left over from user gen to pool -- note c64 may be negative here if pool fee discounts occurred */
         if ( c64 && (pool_has_amt || c64 >= DUST_LIMIT_SATS) && sdata->txnlen) {
@@ -1019,7 +914,7 @@ static void generate_coinbase(const pool_t *ckp, workbase_t *wb)
             pf64 = (uint64_t)(((int64_t)pf64) + c64); // add or deduct modifiction returned from add_user_generation
             if (!pool_has_amt && pf64 >= DUST_LIMIT_SATS) {
                 // pay extra change > dust limit back to pool, new output at end
-                pool_amt_pos = _add_txnbin(&txns_buf, pf64, sdata->txnbin, sdata->txnlen);
+                pool_amt_pos = _add_txnbin(cb1_buf, pf64, sdata->txnbin, sdata->txnlen);
                 pool_has_amt = true;
                 ok = true;
             } else if (pool_has_amt && pf64 >= DUST_LIMIT_SATS) {
@@ -1030,7 +925,7 @@ static void generate_coinbase(const pool_t *ckp, workbase_t *wb)
             if (ok) {
                 uint64_t pool_amt = 0;
                 if (pool_has_amt) {
-                    memcpy(&pool_amt, txns_buf.buffer.value + pool_amt_pos, sizeof(pool_amt));
+                    memcpy(&pool_amt, cb1_buf->buffer.value + pool_amt_pos, sizeof(pool_amt));
                     pool_amt = le64toh(pool_amt);
                 }
                 LOGINFO("%"PRId64" sats adjustment to pool address: %s, total pool payout now: %1.8f",
@@ -1059,62 +954,162 @@ static void generate_coinbase(const pool_t *ckp, workbase_t *wb)
         }
     } else {
         // payout directly to pool in this mode (asicseer-db mode)
-        pool_amt_pos = _add_txnbin(&txns_buf, g64, sdata->txnbin, sdata->txnlen);
+        pool_amt_pos = _add_txnbin(cb1_buf, g64, sdata->txnbin, sdata->txnlen);
         pool_has_amt = true;
     }
 #undef SET_POOL_AMT
+}
+
+/// This is called in a serialized context (from a ckmsgq)
+static void generate_coinbase(const pool_t *ckp, workbase_t *wb)
+{
+    static const size_t COINB1_INITIAL_CAPACITY = 512;
+    const int64_t t0 = time_micros();
+    char header[228];
+    cb1_buffer_t cb1_buf;
+    strbuffer_t *strbuf = &cb1_buf.buffer; // for convenience -- used below
+    int len = 0;
+
+    // ensure these are cleared (they normally already are)
+    wb->coinb1bin = wb->coinb2bin = NULL;
+    wb->coinb1len = wb->coinb2len = 0;
+
+    /* Pre-allocate 512 bytes */
+    cb1_buffer_init(&cb1_buf, COINB1_INITIAL_CAPACITY);
+
+    strbuffer_append_bytes(strbuf, scriptsig_header_bin, 41); // fixed header length
+    strbuffer_append_byte(strbuf, 0); // Script length is filled in at the end @ buffer position [41]
+
+    /* Put block height at start of scriptsig (consensus rule) */
     {
-        assert(!wb->coinb2bin);
-        // take back the coinb2 pointer, write compact size before the txns.
-        // note that we may have to move the data blob back by 2 bytes here.
-        const size_t num_txns = txns_buf.num_txns;
+        char buf[8];
+        len = ser_cbheight((uchar *)buf, wb->height);
+        strbuffer_append_bytes(strbuf, buf, len);
+    }
+
+    len = strbuf->length - 41 - 1; // account for the header and scriptsig length byte.
+    {
+        // ensure that what follows is <=100 bytes total for the scriptsig otherwise
+        // block will be rejected as per BCH consensus rules.
+        const int spaceLeft = MAX_COINBASE_SCRIPTSIG_LEN - len;
+        if (ckp->n_bchsigs > 0) {
+            // pick a random coinbase text from the array of sigs defined in conf "bchsig"
+            // (this may be just 1 item or empty)
+            const int which = random_threadsafe(ckp->n_bchsigs);
+            __typeof__(ckp->bchsigs) sig = ckp->bchsigs + which;
+            if (sig->siglen > 0 && sig->sig && spaceLeft > 0) {
+                const int n = MIN(sig->siglen, spaceLeft);
+                const size_t pos = strbuf->length;
+                strbuffer_append_bytes(strbuf, sig->sig, n);
+                LOGDEBUG("CB text: \"%.*s\"", n, strbuf->value + pos);
+            }
+        }
+    }
+
+    len = strbuf->length - 41 - 1; // again, account for the header and scriptsig length byte.
+    /* Set the scriptsig length now - always 1 byte of data (length is always <=100) */
+    strbuf->uvalue[41] = (uint8_t)len;
+
+    if (unlikely(len > MAX_COINBASE_SCRIPTSIG_LEN || len <= 0)) {
+        // Paranoia: This should never happen. But if it does, we need to quit ASAP since mining will break.
+        // Taking this branch indicates a bug in the code above.
+        quit(1, "INTERNAL ERROR: Max coinbase scriptsig length is %d, but we generated a scriptsig of "
+             "%d bytes.  File: %s, line: %d", (int)MAX_COINBASE_SCRIPTSIG_LEN, (int)(wb->coinb1bin[41]),
+             __FILE__, (int)__LINE__);
+    }
+    // after scriptsig, put sequence
+    strbuffer_append_bytes(strbuf, "\xff\xff\xff\xff", 4);
+
+    // at this point strbuf (and cb1_buf) points to the tx.vout length field (compact size).
+    // reserve 3 bytes for this field.  Common case is we will have to move the data back by 2 bytes, however.
+    const int compact_size_pos = strbuf->length;
+    static const int compact_size_reserved = 3;
+    {
+        char *resv = alloca(compact_size_reserved);
+        memset(resv, 0, compact_size_reserved);
+        strbuffer_append_bytes(strbuf, resv, compact_size_reserved);
+    }
+    int first_tx_pos = strbuf->length;
+
+    /* Add all the payout outputs (including pool fees and donations, if any, etc).
+       In the rare case of leftover satoshis, they are guaranteed to go back to the pool
+       as a fallback.  The below call always succeeds if it returns. */
+    add_coinbase_payouts(ckp, wb, &cb1_buf);
+
+    /* OP_RETURN output at end, after all payouts */
+    {
+        // append OP_RETURN output (this leaves space for enonce1 and enonce2)
+        wb->enonce1varlen = ckp->nonce1length;
+        wb->enonce2varlen = ckp->nonce2length;
+        static const uint8_t amt0[8] = {0,0,0,0,0,0,0,0};
+        // script is: OP_RETURN length_byte(20) enonce1_bytes[4] enonce2_bytes[8] timestamp_bytes[8]
+        int scriptlen = 1 + 1 + wb->enonce1varlen + wb->enonce2varlen + sizeof(t0);
+        strbuffer_append_bytes(strbuf, amt0, 8); // amount
+        assert(scriptlen < 223 && scriptlen > 2); // script should be > 2 bytes and less than max OP_RETURN size
+        strbuffer_append_byte(strbuf, (char)scriptlen); // push script length
+        strbuffer_append_byte(strbuf, (char)0x6a); // push OP_RETURN
+        strbuffer_append_byte(strbuf, (char)scriptlen - 2); // push OP_RETURN payload length
+        ++cb1_buf.num_outs; // increment output counter for this OP_RETURN output
+    }
+    /* Cb1 is done. Take the pointer, assign it to coinb1bin, write compact size before the outs. */
+    {
+        // note that we may have to move the data blob back by 2 bytes here if <253 outs.
+        const size_t num_outs = cb1_buf.num_outs;
         size_t endpos, cap;
-        txns_buffer_take(&txns_buf, (void **)&wb->coinb2bin, &endpos, &cap);
-        LOGDEBUG("Coinb2 taken, endpos: %lu cap: %lu", endpos, cap);
-        assert(endpos + wb->coinb1len + wb->enonce1varlen + wb->enonce2varlen <= MAX_COINBASE_TX_LEN
-               && "INTERNAL ERROR: coinbase tx length exceeded. FIXME!");
-        wb->coinb2len = (int)endpos;
-        assert(((size_t)wb->coinb2len) == endpos && wb->coinb2len > -1 && "INTERNAL ERROR: integer overflow");
+        cb1_buffer_take(&cb1_buf, (void **)&wb->coinb1bin, &endpos, &cap);
+        LOGDEBUG("Coinb1 taken, endpos: %lu cap: %lu", endpos, cap);
+        wb->coinb1len = (int)endpos;
+        assert(((size_t)wb->coinb1len) == endpos && wb->coinb1len > -1 && "INTERNAL ERROR: integer overflow");
         uint8_t *compact_size_buf = alloca(9);
-        const int nb = write_compact_size(compact_size_buf, num_txns);
+        const int nb = write_compact_size(compact_size_buf, num_outs);
         if (unlikely(nb > compact_size_reserved)) {
-            quit(1, "INTERNAL ERROR: Got %lu txs in coinbase! This is unsupported!", num_txns);
+            quit(1, "INTERNAL ERROR: Got %lu outs in coinbase! This is unsupported!", num_outs);
         } else if (nb == compact_size_reserved) {
-            // >= 253 txns. this is what we assumed as worst-case and we don't need to realign the data.
-            memcpy(wb->coinb2bin + compact_size_pos, compact_size_buf, nb);
+            // >= 253 outs. this is what we assumed as worst-case and we don't need to realign the data.
+            memcpy(wb->coinb1bin + compact_size_pos, compact_size_buf, nb);
         } else if (nb == 1) {
-            // < 253 txns, we need to slide the tx data blob backwards by 2 bytes.
-            const int blob_size = wb->coinb2len - first_tx_pos;
+            // < 253 outs, we need to slide the tx data blob backwards by 2 bytes.
+            const int blob_size = wb->coinb1len - first_tx_pos;
             const int ndiff = compact_size_reserved - nb;
             assert(blob_size >= 0);
             assert(ndiff == first_tx_pos - (compact_size_pos + 1));
             if (blob_size) {
-                memmove(wb->coinb2bin + compact_size_pos + 1, wb->coinb2bin + first_tx_pos, blob_size);
+                memmove(wb->coinb1bin + compact_size_pos + 1, wb->coinb1bin + first_tx_pos, blob_size);
                 endpos -= ndiff;
-                wb->coinb2len -= ndiff;
-                LOGDEBUG("Coinb2 moved %d-byte blob backwards by %d bytes, endpos now: %d",
-                         blob_size, ndiff, wb->coinb2len);
+                wb->coinb1len -= ndiff;
+                LOGDEBUG("Coinb1 moved %d-byte blob backwards by %d bytes, endpos now: %d",
+                         blob_size, ndiff, wb->coinb1len);
             }
             first_tx_pos -= ndiff;
-            wb->coinb2bin[compact_size_pos] = *compact_size_buf; // write size byte
+            wb->coinb1bin[compact_size_pos] = *compact_size_buf; // write size byte
         } else {
             // this should never happen.
             quit(1, "Unexpected compact_size number of bytes!");
         }
-        LOGDEBUG("num_txs: %lu", num_txns);
+        LOGDEBUG("num_outs: %lu", num_outs);
     }
-    wb->coinb2len += 4; // Blank lock
+    wb->coinb1 = bin2hex(wb->coinb1bin, wb->coinb1len);
+    LOGDEBUG("Coinb1: %s", wb->coinb1);
+    /* Coinbase 1 complete */
 
+    wb->coinb2len = sizeof(t0) + 4; // timestamp (end of OP_RETURN) + nlocktime == 4 bytes of zeroes at end
+    wb->coinb2bin = ckzalloc(wb->coinb2len);
+    memcpy(wb->coinb2bin, &t0, sizeof(t0)); // copy timestamp to end of OP_RETURN
     wb->coinb2 = bin2hex(wb->coinb2bin, wb->coinb2len);
     LOGDEBUG("Coinb2: %s", wb->coinb2);
     /* Coinbase 2 complete */
 
+    if (unlikely(wb->coinb1len + wb->enonce1varlen + wb->enonce2varlen + wb->coinb2len > MAX_COINBASE_TX_LEN)) {
+        // reaching this branch indicates a programming error above. This should never happen.
+        quit(1, "INTERNAL ERROR: coinbase tx length exceeded %d bytes. FIXME!", (int)MAX_COINBASE_TX_LEN);
+    }
+
     snprintf(header, 225, "%s%s%s%s%s%s%s",
-         wb->bbversion, wb->prevhash,
-         "0000000000000000000000000000000000000000000000000000000000000000",
-         wb->ntime, wb->nbit,
-         "00000000", /* nonce */
-         workpadding);
+             wb->bbversion, wb->prevhash,
+             "0000000000000000000000000000000000000000000000000000000000000000",
+             wb->ntime, wb->nbit,
+             "00000000", /* nonce */
+             workpadding);
     LOGDEBUG("Header: %s", header);
     hex2bin(wb->headerbin, header, 112);
     LOGDEBUG("%s: took %0.6f secs", __FUNCTION__, (time_micros()-t0)/1e6);
@@ -3603,7 +3598,7 @@ static void update_notify(pool_t *ckp, const char *cmd)
     wb->coinb1 = ckalloc(wb->coinb1len * 2 + 1);
     json_strcpy(wb->coinb1, val, "coinbase1");
     hex2bin(wb->coinb1bin, wb->coinb1, wb->coinb1len);
-    wb->height = get_sernumber(wb->coinb1bin + 42);
+    wb->height = deser_cbheight(wb->coinb1bin + 42);
     json_strdup(&wb->coinb2, val, "coinbase2");
     wb->coinb2len = strlen(wb->coinb2) / 2;
     wb->coinb2bin = ckalloc(wb->coinb2len);
@@ -4338,8 +4333,11 @@ static void block_solve(pool_t *ckp, json_t *val)
     int height = 0;
     ts_t ts_now;
 
-    if (!ckp->node)
+    if (!ckp->node && !ckp->n_notify_btcds) {
+        /* We only update_base if !node and if we are not using a notifier otherwise we rely on
+        the notifier to call update_base() for us and this call would be redundant. */
         update_base(sdata, GEN_PRIORITY);
+    }
 
     ts_realtime(&ts_now);
     sprintf(cdfield, "%lu,%lu", ts_now.tv_sec, ts_now.tv_nsec);
@@ -5292,6 +5290,134 @@ static void *blockupdate(void *arg)
     return NULL;
 }
 
+
+// this thread is only created only if ckp->n_zmq_btcds > 0
+static void *zmqnotify(void *arg)
+{
+    pthread_detach(pthread_self());
+    rename_proc("zmqnotify");
+
+    LOGINFO("ZMQ: thread started");
+
+    pool_t *ckp = (pool_t *)arg;
+    sdata_t *sdata = ckp->sdata;
+    const int N = ckp->n_zmq_btcds; // the number of elements in the above arrays
+    assert(N > 0); // this thread should only be created if it has at least 1 btcdzmqblock endpoint to monitor
+
+    // allocate dynamic structures for each btcd endpoint we plan to poll
+    const char *endpoints[N];
+    zmq_pollitem_t poll_items[N];
+    memset(endpoints, 0, N * sizeof(*endpoints));
+    memset(poll_items, 0, N * sizeof(*poll_items));
+
+    void *context = zmq_ctx_new();
+    int rc;
+
+    assert(context);
+    for (int i = 0, btcdidx = 0; i < N; ++i) {
+        const char *endpoint = NULL;
+        for ( ; !endpoint && btcdidx < ckp->btcds; ++btcdidx) {
+            // find the btcd corresponding to this zmq index i
+            endpoint = ckp->btcdzmqblock[btcdidx];
+        }
+        if (unlikely(!endpoint)) {
+            // this should never happen. It indicates a programming error if it does.
+            quit(1, "ZMQ: INTERNAL ERROR: Could not find the endpoint entry #%d in config!", i+1);
+        }
+        endpoints[i] = endpoint;
+        void *zs = zmq_socket(context, ZMQ_SUB);
+        if (!zs)
+            quit(1, "zmq_socket #%d failed with errno %d", i+1, errno);
+        rc = zmq_setsockopt(zs, ZMQ_SUBSCRIBE, "hashblock", 0);
+        if (rc < 0)
+            quit(1, "zmq_setsockopt #%d failed with errno %d", i+1, errno);
+        rc = zmq_connect(zs, endpoint);
+        if (rc < 0)
+            quit(1, "zmq_connect #%d to %s failed with errno %d", i+1, endpoint, errno);
+        LOGNOTICE("ZMQ: subscribed #%d to %s for \"hashblock\"", i+1, endpoint);
+        poll_items[i].socket = zs;
+        poll_items[i].events = ZMQ_POLLIN;
+    }
+
+    uint8_t last_hash_seen[32] = {};
+
+    while (1) {
+        int num_ready = zmq_poll(poll_items, N, -1);
+        if (num_ready < 0) {
+            LOGWARNING("ZMQ: got error return from zmq_poll with errno %d", errno);
+            sleep(5);
+            continue;
+        }
+        for (int i = 0; i < N && num_ready; ++i) {
+            if (poll_items[i].revents & ZMQ_POLLIN) {
+                --num_ready;
+                const char * const endpoint = endpoints[i];
+                LOGDEBUG("ZMQ: %s #%d was ready, num_ready now: %d", endpoint, i+1, num_ready);
+                // do stuff with sock
+                void *zs = poll_items[i].socket;
+                bool keeptrying;
+                do {
+                    zmq_msg_t message;
+
+                    zmq_msg_init(&message);
+                    rc = zmq_msg_recv(&message, zs, ZMQ_DONTWAIT);
+
+                    keeptrying = false;
+
+                    if (rc < 0) {
+                        if (likely(errno == EAGAIN)) {
+                            LOGDEBUG("ZMQ: zmq_msg_recv on %s #%d got EAGAIN ...", endpoint, i+1);
+                        } else {
+                            LOGWARNING("ZMQ: zmq_msg_recv on %s #%d failed with error %d", endpoint, i+1, errno);
+                            sleep(1);
+                        }
+                    } else {
+                        int size = zmq_msg_size(&message);
+
+                        keeptrying = true;
+
+                        switch (size) {
+                        case 9:
+                            LOGDEBUG("ZMQ: %s #%d hashblock message", endpoint, i+1);
+                            break;
+                        case 4:
+                            LOGDEBUG("ZMQ: %s #%d sequence number", endpoint, i+1);
+                            break;
+                        case 32: {
+                            char hexhash[65];
+                            const void *msg_data = zmq_msg_data(&message);
+                            const bool is_new = memcmp(last_hash_seen, msg_data, 32) != 0;
+                            memcpy(last_hash_seen, msg_data, 32);
+                            __bin2hex(hexhash, msg_data, 32);
+                            LOGNOTICE("ZMQ: %s #%d - block hash: %s - is_new: %s", endpoint, i+1, hexhash,
+                                      is_new ? "yes" : "no");
+                            if (is_new)
+                                update_base(sdata, GEN_PRIORITY);
+                            break;
+                        }
+                        default:
+                            LOGWARNING("ZMQ: %s #%d message size error, size = %d!", endpoint, i+1, size);
+                            break;
+                        }
+                        if (!zmq_msg_more(&message)) {
+                            LOGDEBUG("ZMQ: %s #%d message complete", endpoint, i+1);
+                        }
+                    }
+
+                    zmq_msg_close(&message);
+                } while (keeptrying);
+            }
+            poll_items[i].revents = 0;
+        }
+    }
+    for (int i = 0; i < N; ++i)
+        zmq_close(poll_items[i].socket);
+    zmq_ctx_destroy(context);
+
+    return NULL;
+}
+
+
 /* Enter holding workbase_lock and client a ref count. */
 static void __fill_enonce1data(const workbase_t *wb, stratum_instance_t *client)
 {
@@ -5570,6 +5696,8 @@ static json_t *parse_subscribe(stratum_instance_t *client, const int64_t client_
         }
     } else
         client->useragent = ckzalloc(1);
+
+    LOGDEBUG("client %"PRId64" useragent \"%s\"", client_id, client->useragent ? : "");
 
     /* Whitelist cgminer based clients to receive stratum messages */
     if (strcasestr(client->useragent, "gminer"))
@@ -9710,24 +9838,16 @@ out:
     }
 }
 
-void normalize_bchsig(char *s)
+void normalize_bchsig(char *s, int *len)
 {
-    char buf[MAX_USER_COINBASE_LEN + 1];
-    int i = 0, j = 0;
-    memset(buf, 0, MAX_USER_COINBASE_LEN + 1);
-    if (!s || !*s)
+    if (!s || !len)
         return;
-    for (i = 0; s[i] && (isspace(s[i]) || s[i] == '/'); ++i)
-        ; /* ffwd past leading whitespace and '/' */
-    for (j = 0; j < MAX_USER_COINBASE_LEN && s[i]; ++i) {
-        if (s[i] == '/')
-            continue;
-        buf[j++] = s[i];
+    *len = strlen(s);
+    if (*len > MAX_USER_COINBASE_LEN) {
+        // truncate to MAX_USER_COINBASE_LEN
+        *len = MAX_USER_COINBASE_LEN;
+        s[MAX_USER_COINBASE_LEN] = 0;
     }
-    while (j > 0 && isspace(buf[j-1])) // strip trailing whitespace
-        --j;
-    buf[j] = 0; // truncate string in case loop above decremented j
-    strncpy(s, buf, j + 1); // this is guaranteed to be terminated with NUL here.
 }
 
 static bool get_chain_and_prefix(pool_t *ckp)
@@ -9757,7 +9877,7 @@ static bool get_chain_and_prefix(pool_t *ckp)
 void *stratifier(void *arg)
 {
     proc_instance_t *pi = (proc_instance_t *)arg;
-    pthread_t pth_blockupdate, pth_statsupdate, pth_heartbeat;
+    pthread_t pth_blockupdate, pth_statsupdate, pth_heartbeat, pth_zmqnotify;
     int threads, tvsec_diff = 0;
     pool_t *ckp = pi->ckp;
     int64_t randomiser;
@@ -9866,6 +9986,10 @@ void *stratifier(void *arg)
 
     mutex_init(&sdata->update_time_lock);
     mutex_init(&sdata->last_hash_lock);
+
+    if (ckp->n_zmq_btcds > 0) {
+        create_pthread(&pth_zmqnotify, zmqnotify, ckp);
+    }
 
     ckp->stratifier_ready = true;
     LOGWARNING("%s stratifier ready", ckp->name);

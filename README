@@ -30,11 +30,12 @@ It has been updated and reworked to add features and to support Bitcoin Cash
 * Configurable pool fee support
    - Features 20% of pool fee as a dev donation to Calin (me), and Bitcoin Cash
      Node wallets, by default.
-* Added "mindiff_overrides" which allows a pool to give out larger minimum
-  and starting difficulty for stratum clients matching a particular user agent
+* Added "mindiff_overrides" which allows a pool to give out larger minimum and
+  starting difficulty for stratum clients matching a particular user agent
   string (useful for NiceHash, which requires pools have a high difficulty).
 * Updated asicseer-db (formerly ckdb) sources to actually compile on modern
   Linux
+* Added ZMQ support for new block notifications
 * Fixed bugs
 
 README follows (modified by Calin from the original to reflect added config
@@ -57,8 +58,8 @@ Architecture:
 - Low level hand coded architecture relying on minimal outside libraries beyond
   basic glibc functions for maximum flexibility and minimal overhead that can be
   built and deployed on any Linux installation.
-- Multiprocess+multithreaded design to scale to massive deployments and
-  capitalise on modern multicore/multithread CPU designs.
+- Multiprocess & multithreaded design to scale to massive deployments and
+  capitalize on modern multicore/multithread CPU designs.
 - Minimal memory overhead.
 - Utilises ultra reliable unix sockets for communication with dependent
   processes.
@@ -69,8 +70,8 @@ Architecture:
 
 Modes of deployment:
 - Comprehensive pooled mining solution with a postgresql database interface.
-- Passthrough node(s) that combine connections to a single socket which can
-  be used to scale to millions of clients and allow the main pool to be isolated
+- Passthrough node(s) that combine connections to a single socket which can be
+  used to scale to millions of clients and allow the main pool to be isolated
   from direct communication with clients.
 - Proxy nodes with a database that act as a single client to the upstream pool
   while storing full client data of their own.
@@ -82,9 +83,9 @@ Modes of deployment:
 Features:
 - Bitcoind communication to unmodified bitcoind with multiple failover to local
   or remote locations.
-- Local pool instance worker limited only by operating system resources and
-  can be made virtually limitless through use of multiple downstream
-  passthrough nodes.
+- Local pool instance worker limited only by operating system resources and can
+  be made virtually limitless through use of multiple downstream passthrough
+  nodes.
 - Proxy and passthrough modes can set up multiple failover upstream pools.
 - Optional share logging.
 - Virtually seamless restarts for upgrades through socket handover from exiting
@@ -92,12 +93,12 @@ Features:
 - Configurable custom coinbase signature.
 - Configurable instant starting and minimum difficulty.
 - Rapid vardiff adjustment with stable unlimited maximum difficulty handling.
-- New work generation on block changes incorporate full bitcoind transaction
-  set without delay or requiring to send transactionless work to miners thereby
+- New work generation on block changes incorporate full bitcoind transaction set
+  without delay or requiring to send transactionless work to miners thereby
   providing the best bitcoin network support and rewarding miners with the most
   transaction fees.
-- Event driven communication based on communication readiness preventing
-  slow communicating clients from delaying low latency ones.
+- Event driven communication based on communication readiness preventing slow
+  communicating clients from delaying low latency ones.
 - Stratum messaging system to running clients.
 - Accurate pool and per client statistics.
 - Multiple named instances can be run concurrently on the same machine.
@@ -110,7 +111,7 @@ BUILDING:
 Building asicseer-pool standalone without asicseer-db has no dependencies
 outside of the basic build tools on any Linux installation.
 
-sudo apt-get install build-essential yasm
+sudo apt-get install build-essential yasm libzmq3-dev
 ./configure --without-asicseer-db
 make
 
@@ -118,7 +119,7 @@ make
 Building with asicseer-db requires installation of the postgresql, gsl and ssl
 development libraries.
 
-sudo apt-get install build-essential yasm libpq-dev libgsl-dev
+sudo apt-get install build-essential yasm libzmq3-dev libpq-dev libgsl-dev
 ./configure --with-asicseer-db
 make
 
@@ -131,19 +132,22 @@ N.B.: asicseer-db also requires libssl-dev but libpq-dev depends on it and
 
 Building from git also requires autoconf and automake
 
-sudo apt-get install build-essential yasm libpq-dev libgsl-dev autoconf automake libtool
+sudo apt-get install build-essential yasm libzmq3-dev libpq-dev libgsl-dev autoconf automake libtool
 ./autogen.sh
 ./configure
 make
 
 
 Binaries will be built in the src/ subdirectory. Binaries generated will be:
-asicseer-pool - The main pool back end
-asicseer-db - The pool's database (only if ./configure --with-asicseer-db)
+asicseer-pool - The main pool back-end.
+asicseer-db   - The pool's database (only if ./configure --with-asicseer-db).
 asicseer-pmsg - An application for passing messages in libasicseerpool format
-                to asicseer-pool/asicseer-db
-notifier - An application designed to be run with bitcoind's -blocknotify to
-           notify asicseer-pool of block changes.
+                to asicseer-pool/asicseer-db.
+notifier      - An application designed to be run with bitcoind's -blocknotify
+                to notify asicseer-pool of block changes. It is recommended
+                that you not use this application but instead configure
+                bitcoind to use ZMQ -zmqpubhashblock= and set the "zmq" field
+                for each bitcoind.
 
 
 Installation is NOT required and asicseer-pool can be run directly from the
@@ -154,8 +158,8 @@ sudo make install
 It is anticipated that pool operators wishing to set up a full database based
 installation of asicseer-pool+asicseer-db will be familiar with setting up
 postgresql and associated permissions to the directories where the various
-processes will communicate with each other and a web server so these will not
-be documented.
+processes will communicate with each other and a web server so these will not be
+documented.
 
 
 ---
@@ -303,21 +307,72 @@ can be used for comments. The options recognised are as follows:
 
 "bchsig" :
     This is optional text to put into the coinbase transaction of mined blocks.
+    It will be verbatim copied to the coinbase scriptsig (max 96 bytes).
+
+    You may specify either a string or an array of strings here. If an array is
+    specified, then a string will be randomly picked from the array each time
+    a new coinbase transaction is generated.
+
+    Example 1:
+
+        "bchsig" : "/This is my pool's only sig - Use BCHN/
+
+    Example 2:
+
+        "bchsig" : [
+            "/This is a sig/",
+            "/This is another sig/"
+        ]
 
 "blockpoll" :
-    This is the frequency in milliseconds for how often to check for new network
-    blocks and is 100 by default. It is intended to be a backup only for when
-    the notifier is not set up and only polls if the "notify" field is not set
-    on a btcd.
+    The frequency in milliseconds for how often to check for new network blocks
+    (default: 100). This is intended to be a backup only for when the notifier
+    and/or zmq are not set up and only polls if neither the "notify" nor "zmq"
+    fields are not set on a btcd.
 
 "btcd" :
-    This is an array of bitcoind(s) with the options url, auth and pass which
-    match the configured bitcoind. The optional boolean field notify tells
-    asicseer-pool this btcd is using the notifier and does not need to be polled
-    for block changes. If no btcd is specified, asicseer-pool will look for one
-    on localhost:8332 with the username "user" and password "pass". This
-    maintainers of this software recommend BCHN as the bitcoind node
-    implementation to use, since it has the fasted JSON-RPC implementation.
+    This is an array of bitcoind(s) with the options: "url", "auth" and "pass"
+    which match the configured bitcoind. The optional boolean field "notify", if
+    true, tells asicseer-pool that this bitcoind is using the notifier, and does
+    not need to be polled for block changes.
+
+    Additionally, the string option "zmq" : "tcp://ip.to.bitcoind:port" can be
+    specified per btcd in which case the software will subscribe to the
+    bitcoind's ZMQ pub "hashblock" notification to receive blockchain change
+    notifications. This requires bitcoind be configured with the same
+    -zmqpubhashblock= option. The option "zmq", if present, also implies
+    "notify" : true. It is highly recommended that pool operators use this zmq
+    facility to receive blockchain change notifications from bitcoind, since it
+    is the lowest-latency mechanism available, and it reduces overhead as
+    compared to polling.
+
+    If no btcd is specified, asicseer-pool will look for one on localhost:8332
+    with the username "user" and password "pass". The maintainers of this
+    software recommend BCHN as the bitcoind node implementation to use, since it
+    has the fastest JSON-RPC implementation.
+
+    Example:
+
+        "btcd" : [
+            {
+               "url" : "192.168.0.101:8332",
+               "auth" : "someuser1",
+               "pass" : "somepass1",
+               "zmq" : "tcp://192.168.0.101:28332"
+            },
+            {
+               "url" : "192.168.0.15:8332",
+               "auth" : "someuser2",
+               "pass" : "somepass2",
+               "zmq" : "tcp://192.168.0.15:28332"
+            },
+            {
+               "url" : "192.168.0.151:8332",
+               "auth" : "this_one_polls",
+               "pass" : "zzz",
+               "notify" : false
+            }
+        ]
 
 "fee_discounts":
     Offer discounts to specific users, keyed off their mining address. 1.0 =
@@ -326,11 +381,11 @@ can be used for comments. The options recognised are as follows:
 
     Example:
 
-    "fee_discounts" : {
-       "address1" : 0.25,
-       "address2" : 0.33,
-       "address3" : 1.0
-    }
+        "fee_discounts" : {
+           "address1" : 0.25,
+           "address2" : 0.33,
+           "address3" : 1.0
+        }
 
 "logdir" :
     Which directory to store pool and client logs. Default "logs"
@@ -350,10 +405,10 @@ can be used for comments. The options recognised are as follows:
 
     Example:
 
-    "mindiff_overrides" : {
-        "nicehash" : 500000,
-        "foohash" : 750000
-    }
+        "mindiff_overrides" : {
+            "nicehash" : 500000,
+            "foohash" : 750000
+        }
 
     This is a mechanism to support a raised minimum difficulty for clients
     connecting to the pool based on their "useragent" string (that they normally
@@ -415,4 +470,3 @@ can be used for comments. The options recognised are as follows:
     This is a mask of which bits in the version number it is valid for a client
     to alter and is expressed as an hex string. Eg "00fff000" Default is
     "1fffe000".
-

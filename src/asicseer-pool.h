@@ -130,7 +130,7 @@ struct server_instance {
     char *url;
     char *auth;
     char *pass;
-    atomic_bool notify;
+    atomic_bool notify; // this is true if either "notify": true in JSON or if this btcd has a zmq endpoint
     atomic_bool alive;
     connsock_t cs;
 };
@@ -260,6 +260,9 @@ struct pool_instance {
     char **btcdauth;
     char **btcdpass;
     bool *btcdnotify;
+    char **btcdzmqblock; // per-btcd zmqpubhashblock endpoint (each entry in array may be NULL)
+    int n_zmq_btcds; // the count of the above btcds that have a non-NULL btcdzmqblock pointer
+    int n_notify_btcds; // the count of the above btcds that have notify set. This is always >= n_zmq_btcds.
     int blockpoll; // How frequently in ms to poll bitcoind for block updates
     int nonce1length; // Extranonce1 length
     int nonce2length; // Extranonce2 length
@@ -282,9 +285,15 @@ struct pool_instance {
     bool not_mainnet; // if true, we are not on main net but rather on test net or regtest net
 
     /* Coinbase data */
-    char *bchaddress; // Address to mine to. In SPLNS mode this is used as a fallback address ok worker address failure, etc.
+    char *bchaddress; // Address to mine to. In SPLNS mode this is used as a fallback address ok worker address failure, etc, as well as the pool fee address.
     bool script; // Address is a script address
-    char *bchsig; // Optional signature to add to coinbase
+    // optional coinbase scriptsig text. If more than 1 is specified, one is randomly picked each time.
+    struct {
+        char *sig; // Optional signature to add to coinbase
+        int siglen; // 0 or the length of bchsig (always >= 0)
+    } *bchsigs;
+    int n_bchsigs; // the number of bchsigs. May be 0 if bchsigs is NULL.
+
     struct {
         char *address;
         bool isscript;

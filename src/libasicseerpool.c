@@ -72,7 +72,7 @@ void rename_proc(const char *name)
 {
     char buf[16];
 
-    snprintf(buf, 15, "ckp@%s", name);
+    snprintf(buf, 15, "asp@%s", name);
     buf[15] = '\0';
     prctl(PR_SET_NAME, buf, 0, 0, 0);
 }
@@ -1847,7 +1847,7 @@ int address_to_txn(char *p2h, const char *addr, const bool script, const char *c
 }
 
 /*  For encoding nHeight into coinbase, return how many bytes were used */
-int ser_number(uchar *s, int32_t val)
+int ser_cbheight(uchar *s, int32_t val)
 {
     int32_t *i32 = (int32_t *)&s[1];
     int len;
@@ -1866,7 +1866,7 @@ int ser_number(uchar *s, int32_t val)
     return len;
 }
 
-int get_sernumber(uchar *s)
+int deser_cbheight(uchar *s)
 {
     int32_t val = 0;
     int len;
@@ -1992,9 +1992,14 @@ void ts_realtime(ts_t *ts)
 
 int64_t time_micros(void)
 {
+    int64_t ret;
     ts_t ts;
     ts_realtime(&ts);
-    return ts.tv_sec * 1000000L + ts.tv_nsec / 1000L;
+    // we do the below to prevent overflow on 32-bit
+    ret = ts.tv_sec;
+    ret *= (int64_t)1000000L; // seconds -> scaled to millions of microseconds
+    ret += (int64_t)(ts.tv_nsec / 1000L);  // nanoseconds -> to microseconds
+    return ret;
 }
 
 
@@ -2276,4 +2281,30 @@ void gen_hash(uchar *data, uchar *hash, int len)
 
     sha256(data, len, hash1);
     sha256(hash1, 32, hash);
+}
+
+int random_threadsafe(int range)
+{
+    static pthread_mutex_t mut = PTHREAD_MUTEX_INITIALIZER;
+    static struct random_data buf = {};
+    static char state[256] = {};
+    static bool initted = false;
+
+    if (range <= 1)
+        return 0;
+    assert(range <= RAND_MAX);
+
+    pthread_mutex_lock(&mut);
+    if (!initted) {
+        if (initstate_r((unsigned int)(time_micros() % 1000000LL), state, sizeof(state), &buf)) {
+            quit(1, "Got error result from initstate_r with errno %d", errno);
+        }
+        initted = true;
+    }
+    int32_t result = 0;
+    if (random_r(&buf, &result)) {
+        quit(1, "Got error result from random_r with errno %d", errno);
+    }
+    pthread_mutex_unlock(&mut);
+    return result % range;
 }

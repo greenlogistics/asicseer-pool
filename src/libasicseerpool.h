@@ -95,15 +95,18 @@ extern "C" {
 #define __maybe_unused __attribute__((unused))
 #define uninitialised_var(x) x = x
 
+#ifndef MAX
 #define MAX(a,b) \
     ({ __typeof__ (a) _a = (a); \
     __typeof__ (b) _b = (b); \
     _a > _b ? _a : _b; })
-
+#endif
+#ifndef MIN
 #define MIN(a,b) \
     ({ __typeof__ (a) _a = (a); \
     __typeof__ (b) _b = (b); \
     _a < _b ? _a : _b; })
+#endif
 
 typedef unsigned char uchar;
 
@@ -620,8 +623,8 @@ int write_compact_size(void *dest, size_t size_to_write);
 // returns 0 on address parse failure, otherwise returns length of generated CScript
 int address_to_txn(char *p2h, const char *addr, const bool script, const char *default_cashaddr_prefix);
 
-int ser_number(uchar *s, int32_t val);
-int get_sernumber(uchar *s);
+int ser_cbheight(uchar *s, int32_t val);
+int deser_cbheight(uchar *s);
 bool fulltest(const uchar *hash, const uchar *target);
 
 void copy_tv(tv_t *dest, const tv_t *src);
@@ -657,6 +660,9 @@ double diff_from_nbits(char *nbits);
 void target_from_diff(uchar *target, double diff);
 
 void gen_hash(uchar *data, uchar *hash, int len);
+
+/// returns a number in the range [0, range)
+int random_threadsafe(int range);
 
 #ifdef  __cplusplus
 }
