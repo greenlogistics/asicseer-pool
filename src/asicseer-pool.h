@@ -127,9 +127,10 @@ struct server_instance {
     UT_hash_handle hh;
     int id;
 
-    char *url;
-    char *auth;
-    char *pass;
+    const char *url;
+    const char *auth;
+    const char *pass;
+    const char *zmqendpoint; // May be NULL. If not NULL, points to the corresponding string in the pool_instance_t btcdzmqblock, signifying this btcd uses zmq.
     atomic_bool notify; // this is true if either "notify": true in JSON or if this btcd has a zmq endpoint
     atomic_bool alive;
     connsock_t cs;
@@ -286,7 +287,6 @@ struct pool_instance {
 
     /* Coinbase data */
     char *bchaddress; // Address to mine to. In SPLNS mode this is used as a fallback address ok worker address failure, etc, as well as the pool fee address.
-    bool script; // Address is a script address
     // optional coinbase scriptsig text. If more than 1 is specified, one is randomly picked each time.
     struct {
         char *sig; // Optional signature to add to coinbase
@@ -296,7 +296,6 @@ struct pool_instance {
 
     struct {
         char *address;
-        bool isscript;
         bool valid;
     } dev_donations[DONATION_NUM_ADDRESSES];  // [0] = calin, [1] = bchn -- see donation.h
 
@@ -409,6 +408,10 @@ void empty_buffer(connsock_t *cs);
 int set_sendbufsize(pool_t *ckp, const int fd, const int len);
 int set_recvbufsize(pool_t *ckp, const int fd, const int len);
 int read_socket_line(connsock_t *cs, float *timeout);
+/* Like read_socket_line except it doesn't read lines. Designed to be used with
+ * http response content. Read from a socket into cs->buf up to contentlen bytes.
+ */
+int read_socket_contentlen(connsock_t *cs, int contentlen, float *timeout);
 void _queue_proc(proc_instance_t *pi, const char *msg, const char *file, const char *func, const int line);
 #define send_proc(pi, msg) _queue_proc(&(pi), msg, __FILE__, __func__, __LINE__)
 char *_send_recv_proc(const proc_instance_t *pi, const char *msg, int writetimeout, int readtimedout,

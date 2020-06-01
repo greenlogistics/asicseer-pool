@@ -449,11 +449,37 @@ void _cksem_destroy(sem_t *sem, const char *file, const char *func, const int li
         quitfrom(1, file, func, line, "Failed to sem_destroy errno=%d sem=0x%p", errno, sem);
 }
 
+bool extract_zmq_proto_port(const char *z, char **proto, char **port, char **middle)
+{
+    const char *slashes = strstr(z, "//");
+    if (!slashes)
+        return false;
+    const char *middle_start = slashes + 2;
+    const char *prt = strrchr(middle_start, ':');
+    if (!prt || prt - slashes <= 2 || !*++prt)
+        prt = ""; // return empty port if not ':'
+    int protolen = slashes - z;
+    if (protolen > 0 && z[protolen-1] == ':')
+        --protolen;
+    *proto = ckstrndup(z, protolen);
+    if (strcasecmp(*proto, "ipc") == 0)
+        prt = ""; // IPC never has a port.
+    *port = ckstrdup(prt);
+    if (middle) {
+        int middle_len = strlen(middle_start) - strlen(prt);
+        while (middle_len && middle_start[middle_len-1] == ':')
+            --middle_len; // trim trailing ':' character
+        *middle = ckstrndup(middle_start, middle_len);
+    }
+    //LOGDEBUG("PARSED PROTO \"%s\" PORT \"%s\" MIDDLE \"%s\" from \"%s\"", *proto, *port, middle ? *middle : "", z);
+    return true;
+}
+
 /* Extract just the url and port information from a url string, allocating
  * heap memory for sockaddr_url and sockaddr_port. */
-bool extract_sockaddr(char *url, char **sockaddr_url, char **sockaddr_port)
+bool extract_sockaddr(const char *url, char **sockaddr_url, char **sockaddr_port)
 {
-    char *url_begin, *url_end, *ipv6_begin, *ipv6_end, *port_start = NULL;
+    const char *url_begin, *url_end, *ipv6_begin, *ipv6_end, *port_start = NULL;
     char *url_address, *port, *tmp;
     int url_len, port_len = 0;
     size_t hlen;
@@ -1443,6 +1469,22 @@ void *json_ckalloc(size_t size)
     return ckalloc(size);
 }
 
+char *ckstrdup(const char *s)
+{
+    const int len = strlen(s);
+    return ckstrndup(s, len);
+}
+
+char *ckstrndup(const char *s, int len)
+{
+    if (len < 0)
+        return NULL;
+    char *ret = ckzalloc(len + 1);
+    strncpy(ret, s, len);
+    ret[len] = 0;
+    return ret;
+}
+
 void *_ckzrealloc(void *oldbuf, size_t len, bool zeromem, const char *file, const char *func, const int line)
 {
     int backoff = 1;
@@ -1776,7 +1818,7 @@ static const char *remove_any_cashaddr_prefix(const char *addr)
     return ret;
 }
 
-static int address_to_pubkeytxn(char *pkh, const char *addr, const char *cashaddr_prefix)
+static int p2pkh_address_to_script(uchar *pkh, const char *addr, const char *cashaddr_prefix)
 {
     char b58bin[25] = {};
     bool decoded_cashaddr = false;
@@ -1808,7 +1850,7 @@ static int address_to_pubkeytxn(char *pkh, const char *addr, const char *cashadd
     return 25;
 }
 
-static int address_to_scripttxn(char *psh, const char *addr, const char *cashaddr_prefix)
+static int p2sh_address_to_script(uchar *psh, const char *addr, const char *cashaddr_prefix)
 {
     char b58bin[25] = {};
     bool decoded_cashaddr = false;
@@ -1839,16 +1881,17 @@ static int address_to_scripttxn(char *psh, const char *addr, const char *cashadd
 }
 
 /* Convert an address to a transaction and return the length of the transaction */
-int address_to_txn(char *p2h, const char *addr, const bool script, const char *cashaddr_prefix)
+int address_to_script(uchar *p2h, const char *addr, bool is_p2sh, const char *cashaddr_prefix)
 {
-    if (script)
-        return address_to_scripttxn(p2h, addr, cashaddr_prefix);
-    return address_to_pubkeytxn(p2h, addr, cashaddr_prefix);
+    if (is_p2sh)
+        return p2sh_address_to_script(p2h, addr, cashaddr_prefix);
+    return p2pkh_address_to_script(p2h, addr, cashaddr_prefix);
 }
 
 /*  For encoding nHeight into coinbase, return how many bytes were used */
-int ser_cbheight(uchar *s, int32_t val)
+int ser_cbheight(void *outp, int32_t val)
 {
+    uchar *s = (uchar *)outp;
     int32_t *i32 = (int32_t *)&s[1];
     int len;
 
@@ -1866,8 +1909,9 @@ int ser_cbheight(uchar *s, int32_t val)
     return len;
 }
 
-int deser_cbheight(uchar *s)
+int deser_cbheight(const void *inp)
 {
+    const uchar *s = (uchar *)inp;
     int32_t val = 0;
     int len;
 
@@ -1990,18 +2034,22 @@ void ts_realtime(ts_t *ts)
     clock_gettime(CLOCK_REALTIME, ts);
 }
 
+void ts_monotonic(ts_t *ts)
+{
+    clock_gettime(CLOCK_MONOTONIC, ts);
+}
+
 int64_t time_micros(void)
 {
     int64_t ret;
     ts_t ts;
-    ts_realtime(&ts);
+    ts_monotonic(&ts);
     // we do the below to prevent overflow on 32-bit
     ret = ts.tv_sec;
     ret *= (int64_t)1000000L; // seconds -> scaled to millions of microseconds
     ret += (int64_t)(ts.tv_nsec / 1000L);  // nanoseconds -> to microseconds
     return ret;
 }
-
 
 void cksleep_prepare_r(ts_t *ts)
 {
@@ -2202,7 +2250,7 @@ double le256todouble(const uchar *target)
 }
 
 /* Return a difficulty from a binary target */
-double diff_from_target(uchar *target)
+double diff_from_target(const uchar *target)
 {
     double d64, dcut64;
 
@@ -2215,7 +2263,7 @@ double diff_from_target(uchar *target)
 
 /* Return the network difficulty from the block header which is in packed form,
  * as a double. */
-double diff_from_nbits(char *nbits)
+double diff_from_nbits(const uchar *nbits)
 {
     double numerator;
     uint32_t diff32;
@@ -2224,10 +2272,13 @@ double diff_from_nbits(char *nbits)
 
     pow = nbits[0];
     powdiff = (8 * (0x1d - 3)) - (8 * (pow - 3));
-    if (powdiff < 0) // testnet only
+    if (unlikely(powdiff < 0)) // testnet only
         powdiff = 0;
     diff32 = be32toh(*((uint32_t *)nbits)) & 0x00FFFFFF;
     numerator = 0xFFFFULL << powdiff;
+    if (unlikely(diff32 == 0))
+        // this should never happen, but prevent floating point exceptions
+        diff32 = 1;
 
     return numerator / (double)diff32;
 }
@@ -2275,9 +2326,11 @@ void target_from_diff(uchar *target, double diff)
     *data64 = htole64(h64);
 }
 
-void gen_hash(uchar *data, uchar *hash, int len)
+void gen_hash(const uchar *data, uchar *hash, int len)
 {
     uchar hash1[32];
+
+    assert(len > 0);
 
     sha256(data, len, hash1);
     sha256(hash1, 32, hash);

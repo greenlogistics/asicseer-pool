@@ -25,11 +25,12 @@ static bool check_required_rule(const char __maybe_unused * rule)
 
 /* Take a bitcoin address and do some sanity checks on it, then send it to
  * bitcoind to see if it's a valid address */
-bool validate_address(connsock_t *cs, const char *address, bool *script)
+bool validate_address(connsock_t *cs, const char *address, bool *is_p2sh, void *cscript_out, int *cscript_len)
 {
     json_t *val, *res_val, *valid_val, *tmp_val;
     char rpc_req[256];
     bool ret = false;
+    const char *spk = NULL;
 
     if (unlikely(!address)) {
         LOGWARNING("Null address passed to validate_address");
@@ -58,15 +59,48 @@ bool validate_address(connsock_t *cs, const char *address, bool *script)
         LOGDEBUG("Bitcoin address %s is NOT valid", address);
         goto out;
     }
-    ret = true;
-    tmp_val = json_object_get(res_val, "isscript");
-    if (unlikely(!tmp_val)) {
-        /* All recent bitcoinds with wallet support built in should
-         * support this, if not, quit here to keep things simple. */
-        quit(1, "No isscript support from bitcoind -- please use a bitcoind with wallet support.");
+    if (cscript_out) {
+        if (!cscript_len) {
+            LOGERR("cscript_out pointer is not null but cscript_len pointer is null!");
+            goto out;
+        }
+        tmp_val = json_object_get(res_val, "scriptPubKey");
+        if (unlikely(!tmp_val || !(spk = json_string_value(tmp_val)))) {
+            /* All recent bitcoinds with wallet support built in should
+             * support this, if not, quit here to keep things simple. */
+            quit(1, "No scriptPubkey returned for address %s -- please use a bitcoind with wallet support.", address);
+        }
+        const int len = strlen(spk);
+        if (unlikely(!len || len % 2)) {
+            LOGERR("Bad scriptPubkey (not hex?) returned from bitcoind: \"%s\"", spk);
+            goto out;
+        }
+        if (unlikely(len/2 > *cscript_len)) {
+            LOGERR("Not enough space for scriptPubkey in output buffer: %d bytes required but only %d bytes specified.",
+                   len/2, *cscript_len);
+            goto out;
+        }
+        *cscript_len = len/2;
+        if (unlikely(!hex2bin(cscript_out, spk, *cscript_len))) {
+            LOGERR("scriptPubkey failed to parse as hex: %s", spk);
+            goto out;
+        }
     }
-    *script = json_is_true(tmp_val);
-    LOGDEBUG("Bitcoin address %s IS valid%s", address, *script ? " script" : "");
+    ret = true;
+    if (is_p2sh) {
+        tmp_val = json_object_get(res_val, "isscript");
+        if (unlikely(!tmp_val)) {
+            /* All recent bitcoinds with wallet support built in should
+             * support this, if not, quit here to keep things simple. */
+            quit(1, "No isscript support from bitcoind -- please use a bitcoind with wallet support.");
+        }
+        *is_p2sh = json_is_true(tmp_val);
+    }
+    if (spk)
+        LOGDEBUG("Bitcoin address %s IS valid%s with scriptPubkey %s (%d bytes)", address,
+                 is_p2sh && *is_p2sh ? " (p2sh)" : "", spk, cscript_len ? *cscript_len : 0);
+    else
+        LOGDEBUG("Bitcoin address %s IS valid%s", address, is_p2sh && *is_p2sh ? " (p2sh)" : "");
 out:
     if (val)
         json_decref(val);
@@ -419,5 +453,82 @@ char *get_txn(connsock_t *cs, const char *hash)
         LOGDEBUG("get_txn did not retrieve data for hash %s", hash);
     json_decref(val);
 out:
+    return ret;
+}
+
+
+static bool check_bitcoind_getzmqnotifications_matches_proto_and_port(const json_t *array,
+                                                                      const char *type, const char *url,
+                                                                      const char **any)
+{
+    if (!array || !type || !url) {
+        LOGWARNING("%s: bad args", __func__);
+        return false;
+    }
+    if (!json_is_array(array)) {
+        LOGWARNING("%s: response is not an array", __func__);
+        return false;
+    }
+    char *proto = NULL, *port = NULL;
+    if (!extract_zmq_proto_port(url, &proto, &port, NULL)) {
+        LOGWARNING("%s: unable to parse %s", __func__, url);
+        return false;
+    }
+    if (any) *any = NULL;
+    bool ret = false;
+    const size_t asize = json_array_size(array);
+    for (size_t i = 0; i < asize; ++i) {
+        const json_t *obj = json_array_get(array, i);
+        if (!json_is_object(obj)) {
+            LOGWARNING("%s: expected object at position %lu", __func__, i);
+            break;
+        }
+        const json_t *val = json_object_get(obj, "type");
+        if (!val || !json_is_string(val) || strcasecmp(json_string_value(val), type) != 0)
+            // skip, not the type we are looking for
+            continue;
+        val = json_object_get(obj, "address");
+        if (!val || !json_is_string(val))
+            // hmm. unexpected missing value. silently skip.
+            continue;
+        const char *address = json_string_value(val);
+        if (any) *any = address;
+        char *parsed_proto = NULL, *parsed_port = NULL;
+        if (extract_zmq_proto_port(address, &parsed_proto, &parsed_port, NULL)) {
+            const bool match = strcasecmp(parsed_proto, proto) == 0 && strcasecmp(parsed_port, port) == 0;
+            free(parsed_proto);
+            free(parsed_port);
+            if (match) {
+                ret = true;
+                break;
+            }
+        } else {
+            LOGDEBUG("%s: unable to parse item %lu \"address\": %s", __func__, i, address);
+        }
+    }
+    free(proto);
+    free(port);
+    return ret;
+}
+
+bool check_getzmqnotifications_roughly_matches(connsock_t *cs, const char *expected, char **found)
+{
+    if (found) *found = NULL;
+    json_t *resp = json_rpc_response(cs, "{\"method\":\"getzmqnotifications\",\"params\":[]}\n");
+    if (!resp) {
+        LOGDEBUG("%s: getzmqnotifications failed", __func__);
+        return false;
+    }
+    json_t *result = json_object_get(resp, "result");
+    bool ret = false;
+    if (!result)
+        LOGWARNING("%s: getzmqnotifications no result", __func__);
+    else {
+        const char *any = NULL;
+        ret = check_bitcoind_getzmqnotifications_matches_proto_and_port(result, "pubhashblock", expected, &any);
+        if (any && found)
+            *found = ckstrdup(any);
+    }
+    json_decref(resp);
     return ret;
 }

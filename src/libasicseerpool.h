@@ -198,6 +198,8 @@ static inline void flip_80(void *dest_p, const void *src_p)
 #define ckzalloc(len) _ckzrealloc(NULL, len, true, __FILE__, __func__, __LINE__)
 #define ckrealloc(buf, len) _ckzrealloc(buf, len, false, __FILE__, __func__, __LINE__)
 #define ckzrealloc(buf, len) _ckzrealloc(buf, len, true, __FILE__, __func__, __LINE__)
+char *ckstrdup(const char *s);
+char *ckstrndup(const char *s, int len);
 
 #define dealloc(ptr) do { \
     free(ptr); \
@@ -538,12 +540,18 @@ static inline bool sock_timeout(void)
 {
     return (errno == ETIMEDOUT);
 }
-
-bool extract_sockaddr(char *url, char **sockaddr_url, char **sockaddr_port);
+bool extract_sockaddr(const char *url, char **sockaddr_url, char **sockaddr_port);
 bool url_from_sockaddr(const struct sockaddr *addr, char *url, char *port);
 bool addrinfo_from_url(const char *url, const char *port, struct addrinfo *addrinfo);
 bool url_from_serverurl(char *serverurl, char *newurl, char *newport);
 bool url_from_socket(const int sockd, char *url, char *port);
+
+/// Given a zmq endpoint e.g. tcp://someip:1234, extracts the protocol portion
+/// "tcp" and port portion "1234", into malloc'd strings.
+/// If middle pointer is not NULL, will also malloc a string for the middle portion
+/// before the port.
+/// Returns false on parse error (in which case nothing is allocated).
+bool extract_zmq_proto_port(const char *zmqurl, char **proto, char **port, char **middle);
 
 void keep_sockalive(int fd);
 void nolinger_socket(int fd);
@@ -621,10 +629,10 @@ bool cmdmatch(const char *buf, const char *cmd);
 int write_compact_size(void *dest, size_t size_to_write);
 
 // returns 0 on address parse failure, otherwise returns length of generated CScript
-int address_to_txn(char *p2h, const char *addr, const bool script, const char *default_cashaddr_prefix);
+int address_to_script(uchar *script, const char *addr, bool is_p2sh, const char *default_cashaddr_prefix);
 
-int ser_cbheight(uchar *s, int32_t val);
-int deser_cbheight(uchar *s);
+int ser_cbheight(void *s, int32_t val);
+int deser_cbheight(const void *s);
 bool fulltest(const uchar *hash, const uchar *target);
 
 void copy_tv(tv_t *dest, const tv_t *src);
@@ -636,6 +644,9 @@ void ms_to_ts(ts_t *spec, int64_t ms);
 void ms_to_tv(tv_t *val, int64_t ms);
 void tv_time(tv_t *tv);
 void ts_realtime(ts_t *ts);
+void ts_monotonic(ts_t *ts);
+/* This is monotomic time in microseconds, using CLOCK_MONOTONIC. Suitable for profiling
+   or obtaining a unique timestamp throughout the run of the program.  */
 int64_t time_micros(void);
 
 void cksleep_prepare_r(ts_t *ts);
@@ -655,11 +666,11 @@ double sane_tdiff(tv_t *end, tv_t *start);
 void suffix_string(double val, char *buf, size_t bufsiz, int sigdigits);
 
 double le256todouble(const uchar *target);
-double diff_from_target(uchar *target);
-double diff_from_nbits(char *nbits);
+double diff_from_target(const uchar *target);
+double diff_from_nbits(const uchar *nbits);
 void target_from_diff(uchar *target, double diff);
 
-void gen_hash(uchar *data, uchar *hash, int len);
+void gen_hash(const uchar *data, uchar *hash, int len);
 
 /// returns a number in the range [0, range)
 int random_threadsafe(int range);

@@ -203,7 +203,10 @@ static bool server_alive(pool_t *ckp, server_instance_t *si, bool pinging)
 
     if (si->alive)
         return true;
+
     cs = &si->cs;
+
+    // FIXME: the below call is not thread safe since it may modify the cs->url and cs->port pointers -Calin
     if (!extract_sockaddr(si->url, &cs->url, &cs->port)) {
         LOGWARNING("Failed to extract address from %s", si->url);
         return ret;
@@ -229,16 +232,23 @@ static bool server_alive(pool_t *ckp, server_instance_t *si, bool pinging)
     /* Test we can connect, authorize and get a block template */
     if (!gen_gbtbase(cs, &gbt)) {
         if (!pinging) {
-            LOGINFO("Failed to get test block template from %s:%s!",
-                cs->url, cs->port);
+            LOGINFO("Failed to get test block template from %s:%s!", cs->url, cs->port);
         }
         goto out;
     }
     clear_gbtbase(&gbt);
-    if (!ckp->node && !validate_address(cs, ckp->bchaddress, &ckp->script)) {
+    bool is_p2sh;
+    if (!ckp->node && !validate_address(cs, ckp->bchaddress, &is_p2sh, NULL, NULL)) {
         LOGWARNING("Invalid bchaddress: %s !", ckp->bchaddress);
         goto out;
     }
+    char *what_bitcoind_has = NULL;
+    if (!ckp->node && si->zmqendpoint && !check_getzmqnotifications_roughly_matches(cs, si->zmqendpoint, &what_bitcoind_has)) {
+        LOGWARNING("bitcoind %s does not have any ZMQ \"pubhashblock\""
+                   " entries that match the configured value of \"%s\", instead it reports \"%s\"",
+                   si->url, si->zmqendpoint, what_bitcoind_has ? : "");
+    }
+    free(what_bitcoind_has);
     si->alive = cs->alive = ret = true;
     LOGNOTICE("Server alive: %s:%s", cs->url, cs->port);
 out:
@@ -865,7 +875,7 @@ out:
     return gbt;
 }
 
-int generator_getbest(pool_t *ckp, char *hash)
+int generator_getbest(pool_t *ckp, char *hash, bool force)
 {
     gdata_t *gdata = ckp->gdata;
     int ret = GETBEST_FAILED;
@@ -877,7 +887,7 @@ int generator_getbest(pool_t *ckp, char *hash)
         LOGWARNING("No live current server in generator_getbest");
         goto out;
     }
-    if (si->notify) {
+    if (si->notify && !force) {
         ret = GETBEST_NOTIFY;
         goto out;
     }
@@ -909,20 +919,22 @@ out:
     return ret;
 }
 
-bool generator_checkaddr(pool_t *ckp, const char *addr, bool *script)
+int generator_checkaddr(pool_t *ckp, const char *addr, void *cscript_out)
 {
     gdata_t *gdata = ckp->gdata;
     server_instance_t *si;
-    int ret = false;
+    int ret = 0, len = GENERATOR_MAX_CSCRIPT_LEN;
     connsock_t *cs;
 
+    assert(cscript_out);
     si = _get_current_si_threadsafe(gdata);
     if (unlikely(!si)) {
         LOGWARNING("No live current server in generator_checkaddr");
         goto out;
     }
     cs = &si->cs;
-    ret = validate_address(cs, addr, script);
+    if (validate_address(cs, addr, NULL, cscript_out, &len))
+        ret = len;
 out:
     return ret;
 }
@@ -3183,6 +3195,7 @@ static void setup_servers(pool_t *ckp)
         si->auth = ckp->btcdauth[i];
         si->pass = ckp->btcdpass[i];
         si->notify = ckp->btcdnotify[i];
+        si->zmqendpoint = ckp->btcdzmqblock[i];
         si->id = i;
         cs = &si->cs;
         cs->ckp = ckp;

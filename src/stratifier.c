@@ -178,10 +178,9 @@ struct user_instance {
     char username[MAX_USERNAME+1];
     int id;
     char *secondaryuserid;
-    bool bchaddress;
-    bool script;
-    char txnbin[48];
-    int txnlen;
+    bool bchaddress; // true iff the username is a valid bch address
+    uint8_t scriptbin[GENERATOR_MAX_CSCRIPT_LEN]; // address redeem script (scriptPubkey) (only if bchaddress is true)
+    int scriptlen; // length of above scriptbin
 
     /* A linked list of all connected instances of this user */
     stratum_instance_t *clients;
@@ -194,7 +193,8 @@ struct user_instance {
 
     mutex_t stats_lock; /* Protects all user and worker stats */
 
-    double best_diff; /* Best share found by this user */
+    double best_diff; /* Best share found by this user (this is reset on block solve) */
+    double best_diff_alltime; /* Best share found by this user (persistent) */
 
     double herp; /* Rolling HERP value */
     double ua_herp; /* Unaccounted HERP */
@@ -254,7 +254,8 @@ struct worker_instance {
     double lns; /* Rolling LNS */
     double ua_lns; /* Unaccounted LNS */
 
-    double best_diff; /* Best share found by this worker */
+    double best_diff; /* Best share found by this worker (this is reset on block solve) */
+    double best_diff_alltime; /* Best share found by this worker (persistent) */
     int mindiff; /* User chosen mindiff */
 
     bool idle;
@@ -350,7 +351,8 @@ struct stratum_instance {
     time_t disconnected_time; /* Time this instance disconnected */
 
     int64_t suggest_diff; /* Stratum client suggested diff  - note this may also come from mindiff_overrides */
-    double best_diff; /* Best share found by this instance */
+    double best_diff; /* Best share found by this instance (this is reset on block solve) */
+    double best_diff_alltime; /* Best share found by this instance (persistent) */
 
     sdata_t *sdata; /* Which sdata this client is bound to */
     proxy_t *proxy; /* Proxy this is bound to in proxy mode */
@@ -482,11 +484,11 @@ static const char *ckdb_seq_names[] = {
 struct stratifier_data {
     pool_t *ckp;
 
-    char txnbin[48];
-    int txnlen;
+    uint8_t scriptbin[GENERATOR_MAX_CSCRIPT_LEN]; // pool address redeem script (scriptPubkey)
+    int scriptlen; // length of above scriptbin
     struct {
-        char txnbin[48];
-        int txnlen;
+        uint8_t scriptbin[GENERATOR_MAX_CSCRIPT_LEN]; // donation address redeem script (scriptPubkey)
+        int scriptlen; // if valid donation address, length of above, otherwise 0
     } donation_data[DONATION_NUM_ADDRESSES];
     int n_good_donation; // the number of donation addresses above that were correctly parsed
 
@@ -533,14 +535,18 @@ struct stratifier_data {
     sem_t update_sem;
     /* Time we last sent out a stratum update */
     time_t update_time;
-    mutex_t update_time_lock; ///< guards update_time
+    /* Time we last saw a new block in block_update. Will be 0 initially. */
+    time_t last_newblock_time;
+    mutex_t update_time_lock; // guards update_time and last_newblock_time
 
     int64_t workbase_id;
     int64_t blockchange_id;
     int session_id;
+
+    mutex_t last_hash_lock; ///< guards lasthash, lastswaphash, lasthashbin, and lastswaphashbin
     char lasthash[68];
     char lastswaphash[68];
-    mutex_t last_hash_lock; ///< guards lasthash and lastswaphash
+    uint8_t lasthashbin[32], lastswaphashbin[32];
 
     ckmsgq_t *updateq;	// Generator base work updates
     ckmsgq_t *ssends;	// Stratum sends
@@ -666,26 +672,26 @@ static void cb1_buffer_take(cb1_buffer_t *t, void **bufptr, size_t *pos, size_t 
     *bufptr = strbuffer_steal_value(&t->buffer);
 }
 
-/// Add an amount[8 bytes],scriptbinlen[1 byte],scriptbin[txnlen bytes] to cb1_buffer_t `buf`.
+/// Add an amount[8 bytes],scriptbinlen[1 byte],scriptbin[scriptlen bytes] to cb1_buffer_t `buf`.
 /// Returns an index into the buffer where the amount data begins on success.
 /// On failure (which is unlikely) this function will call quit().  So this always returns on success.
-/// IMPORTANT: txnlen must be <253 bytes otherwise this will always fail.
-static size_t _add_txnbin(cb1_buffer_t *buf, uint64_t amount, const void *txnbin, size_t txnlen)
+/// IMPORTANT: scriptlen must be <253 bytes otherwise this will always fail.
+static size_t _add_output(cb1_buffer_t *buf, uint64_t amount, const void *scriptbin, size_t scriptlen)
 {
-    const size_t size = 8 + 1 + txnlen;
-    uint8_t *tmp = alloca(size);
-    const size_t ret = buf->buffer.length;
-    *(uint64_t *)tmp = htole64(amount); // this is guaranteed aligned access
-    if (unlikely(txnlen >= 253)) {
-        quit(1, "INTERNAL ERROR: %s: txnlen must be <253 bytes!", __FUNCTION__);
-        return 0; // not reached
+    if (unlikely(scriptlen >= 253)) {
+        quit(1, "INTERNAL ERROR: %s: scriptlen must be <253 bytes!", __func__);
+        // not reached
     }
-    tmp[8] = (uint8_t)txnlen;
-    memcpy(tmp + 9, txnbin, txnlen);
-    if (unlikely(strbuffer_append_bytes(&buf->buffer, (const char *)tmp, size) != 0)) {
+    const size_t ret = buf->buffer.length;
+    amount = htole64(amount); // ensure little-endian
+    if (unlikely(
+            strbuffer_append_bytes(&buf->buffer, &amount, sizeof(amount)) != 0
+            || strbuffer_append_byte(&buf->buffer, (uint8_t)scriptlen) != 0
+            || strbuffer_append_bytes(&buf->buffer, scriptbin, scriptlen) != 0
+        )) {
         quit(1, "INTERNAL ERROR: %s: buffer size overflow, strbuffer is too large: %lu",
-             __FUNCTION__, buf->buffer.size);
-        return 0; // not reached
+             __func__, buf->buffer.size);
+        // not reached
     }
     assert(++buf->num_outs && "INTERNAL ERROR: integer overflow for cb1_buffer_t::num_outs!");
     return ret;
@@ -787,13 +793,13 @@ static int64_t add_user_generation(sdata_t *sdata, workbase_t *wb, cb1_buffer_t 
             }
             for (int i = 0; i < N; ++i) {
                 const uint64_t rew = per_out + ( i+1 == N ? rem : 0 );
-                amt_pos = _add_txnbin(cb_buf, rew, user->txnbin, user->txnlen);
+                amt_pos = _add_output(cb_buf, rew, user->scriptbin, user->scriptlen);
                 LOGDEBUG("User %s outp %d reward %"PRIu64, user->username, 1 + i + payouts, rew);
             }
         }
 #else
         /* Add the user's coinbase reward, using the cached cscript */
-        amt_pos = _add_txnbin(cb_buf, total_reward, user->txnbin, user->txnlen);
+        amt_pos = _add_output(cb_buf, total_reward, user->scriptbin, user->scriptlen);
 #endif
 
         if (!pf64 && total_reward > max_payee.reward) {
@@ -852,7 +858,7 @@ static void add_coinbase_payouts(const pool_t *ckp, workbase_t *wb, cb1_buffer_t
         // payout to miners directly in SPLNS mode (also pay out hard-coded dev donations)
 
         // first, add pool fee, if any
-        if (likely(f64 >= DUST_LIMIT_SATS && sdata->txnlen)) {
+        if (likely(f64 >= DUST_LIMIT_SATS && sdata->scriptlen)) {
             df64 = DONATION_FRACTION > 0 ? (f64 / DONATION_FRACTION) * sdata->n_good_donation : 0;
             uint64_t don_each = sdata->n_good_donation ? df64 / sdata->n_good_donation : 0;
             if (unlikely(don_each < DUST_LIMIT_SATS || f64 - df64 < DUST_LIMIT_SATS)) {
@@ -863,7 +869,7 @@ static void add_coinbase_payouts(const pool_t *ckp, workbase_t *wb, cb1_buffer_t
             pf64 = f64 - df64;
 
             // add pool net fee
-            pool_amt_pos = _add_txnbin(cb1_buf, pf64, sdata->txnbin, sdata->txnlen);
+            pool_amt_pos = _add_output(cb1_buf, pf64, sdata->scriptbin, sdata->scriptlen);
             pool_has_amt = true;
             const double fee = pf64 / (double)SATOSHIS;
             LOGDEBUG("%1.8f pool fee to pool address: %s", fee, ckp->bchaddress);
@@ -871,9 +877,9 @@ static void add_coinbase_payouts(const pool_t *ckp, workbase_t *wb, cb1_buffer_t
             int64_t leftover = df64;
             if (df64 && don_each) {
                 for (int i = 0; i < DONATION_NUM_ADDRESSES && leftover > 0; ++i) {
-                    if (sdata->donation_data[i].txnlen && ckp->dev_donations[i].valid) {
+                    if (sdata->donation_data[i].scriptlen && ckp->dev_donations[i].valid) {
                         // good address
-                        _add_txnbin(cb1_buf, don_each, sdata->donation_data[i].txnbin, sdata->donation_data[i].txnlen);
+                        _add_output(cb1_buf, don_each, sdata->donation_data[i].scriptbin, sdata->donation_data[i].scriptlen);
                         leftover -= (int64_t)don_each;
                         const double d = don_each / (double)SATOSHIS;
                         LOGDEBUG("%f dev donation to address: %s", d, ckp->dev_donations[i].address);
@@ -909,12 +915,12 @@ static void add_coinbase_payouts(const pool_t *ckp, workbase_t *wb, cb1_buffer_t
         c64 = add_user_generation(sdata, wb, cb1_buf, g64 - f64, pf64); // add miner payouts, minus total fee
 
         /* Add any change left over from user gen to pool -- note c64 may be negative here if pool fee discounts occurred */
-        if ( c64 && (pool_has_amt || c64 >= DUST_LIMIT_SATS) && sdata->txnlen) {
+        if ( c64 && (pool_has_amt || c64 >= DUST_LIMIT_SATS) && sdata->scriptlen) {
             bool ok = false;
             pf64 = (uint64_t)(((int64_t)pf64) + c64); // add or deduct modifiction returned from add_user_generation
             if (!pool_has_amt && pf64 >= DUST_LIMIT_SATS) {
                 // pay extra change > dust limit back to pool, new output at end
-                pool_amt_pos = _add_txnbin(cb1_buf, pf64, sdata->txnbin, sdata->txnlen);
+                pool_amt_pos = _add_output(cb1_buf, pf64, sdata->scriptbin, sdata->scriptlen);
                 pool_has_amt = true;
                 ok = true;
             } else if (pool_has_amt && pf64 >= DUST_LIMIT_SATS) {
@@ -954,7 +960,7 @@ static void add_coinbase_payouts(const pool_t *ckp, workbase_t *wb, cb1_buffer_t
         }
     } else {
         // payout directly to pool in this mode (asicseer-db mode)
-        pool_amt_pos = _add_txnbin(cb1_buf, g64, sdata->txnbin, sdata->txnlen);
+        pool_amt_pos = _add_output(cb1_buf, g64, sdata->scriptbin, sdata->scriptlen);
         pool_has_amt = true;
     }
 #undef SET_POOL_AMT
@@ -982,8 +988,8 @@ static void generate_coinbase(const pool_t *ckp, workbase_t *wb)
 
     /* Put block height at start of scriptsig (consensus rule) */
     {
-        char buf[8];
-        len = ser_cbheight((uchar *)buf, wb->height);
+        uint8_t buf[8];
+        len = ser_cbheight(buf, wb->height);
         strbuffer_append_bytes(strbuf, buf, len);
     }
 
@@ -1025,7 +1031,7 @@ static void generate_coinbase(const pool_t *ckp, workbase_t *wb)
     const int compact_size_pos = strbuf->length;
     static const int compact_size_reserved = 3;
     {
-        char *resv = alloca(compact_size_reserved);
+        uint8_t resv[compact_size_reserved];
         memset(resv, 0, compact_size_reserved);
         strbuffer_append_bytes(strbuf, resv, compact_size_reserved);
     }
@@ -1046,9 +1052,9 @@ static void generate_coinbase(const pool_t *ckp, workbase_t *wb)
         int scriptlen = 1 + 1 + wb->enonce1varlen + wb->enonce2varlen + sizeof(t0);
         strbuffer_append_bytes(strbuf, amt0, 8); // amount
         assert(scriptlen < 223 && scriptlen > 2); // script should be > 2 bytes and less than max OP_RETURN size
-        strbuffer_append_byte(strbuf, (char)scriptlen); // push script length
-        strbuffer_append_byte(strbuf, (char)0x6a); // push OP_RETURN
-        strbuffer_append_byte(strbuf, (char)scriptlen - 2); // push OP_RETURN payload length
+        strbuffer_append_byte(strbuf, (uint8_t)scriptlen); // push script length
+        strbuffer_append_byte(strbuf, 0x6a); // push OP_RETURN
+        strbuffer_append_byte(strbuf, (uint8_t)(scriptlen - 2)); // push OP_RETURN payload length
         ++cb1_buf.num_outs; // increment output counter for this OP_RETURN output
     }
     /* Cb1 is done. Take the pointer, assign it to coinb1bin, write compact size before the outs. */
@@ -1112,7 +1118,7 @@ static void generate_coinbase(const pool_t *ckp, workbase_t *wb)
              workpadding);
     LOGDEBUG("Header: %s", header);
     hex2bin(wb->headerbin, header, 112);
-    LOGDEBUG("%s: took %0.6f secs", __FUNCTION__, (time_micros()-t0)/1e6);
+    LOGDEBUG("%s: took %0.6f secs", __func__, (time_micros()-t0)/1e6);
 }
 
 static void stratum_broadcast_update(sdata_t *sdata, const workbase_t *wb, bool clean);
@@ -1323,14 +1329,15 @@ static void upstream_msgtype(pool_t *ckp, const json_t *val, const int msg_type)
     json_decref(json_msg);
 }
 
-static void send_node_workinfo(pool_t *ckp, sdata_t *sdata, const workbase_t *wb)
+/// we use this function to only bother to build the potentially-heavy workinfo json
+/// object if the DL_FOREACH2 loop in send_node_workinfo actually iterates
+static void __lazy_init_node_workinfo(json_t **wb_val_in, const workbase_t *wb)
 {
-    stratum_instance_t *client;
-    ckmsg_t *bulk_send = NULL;
-    int messages = 0;
-    json_t *wb_val;
+    json_t *wb_val = *wb_val_in;
+    if (wb_val)
+        return;
 
-    wb_val = json_object();
+    *wb_val_in = wb_val = json_object();
 
     json_set_int(wb_val, "jobid", wb->mapped_id);
     json_set_string(wb_val, "target", wb->target);
@@ -1354,9 +1361,18 @@ static void send_node_workinfo(pool_t *ckp, sdata_t *sdata, const workbase_t *wb
     json_set_int(wb_val, "coinb1len", wb->coinb1len);
     json_set_int(wb_val, "coinb2len", wb->coinb2len);
     json_set_string(wb_val, "coinb2", wb->coinb2);
+}
+
+static void send_node_workinfo(pool_t *ckp, sdata_t *sdata, const workbase_t *wb)
+{
+    stratum_instance_t *client;
+    ckmsg_t *bulk_send = NULL;
+    int messages = 0;
+    json_t *wb_val = NULL;
 
     ck_rlock(&sdata->instance_lock);
     DL_FOREACH2(sdata->node_instances, client, node_next) {
+        __lazy_init_node_workinfo(&wb_val, wb);
         ckmsg_t *client_msg;
         smsg_t *msg;
         json_t *json_msg = json_deep_copy(wb_val);
@@ -1371,6 +1387,7 @@ static void send_node_workinfo(pool_t *ckp, sdata_t *sdata, const workbase_t *wb
         messages++;
     }
     DL_FOREACH2(sdata->remote_instances, client, remote_next) {
+        __lazy_init_node_workinfo(&wb_val, wb);
         ckmsg_t *client_msg;
         smsg_t *msg;
         json_t *json_msg = json_deep_copy(wb_val);
@@ -1386,10 +1403,12 @@ static void send_node_workinfo(pool_t *ckp, sdata_t *sdata, const workbase_t *wb
     }
     ck_runlock(&sdata->instance_lock);
 
-    if (ckp->remote)
+    if (ckp->remote) {
+        __lazy_init_node_workinfo(&wb_val, wb);
         upstream_msgtype(ckp, wb_val, SM_WORKINFO);
+    }
 
-    json_decref(wb_val);
+    json_decref(wb_val); // NULL is noop
 
     if (bulk_send) {
         LOGINFO("Sending workinfo to mining nodes");
@@ -1460,7 +1479,7 @@ static void add_base(pool_t *ckp, sdata_t *sdata, workbase_t *wb, bool *new_bloc
     int len, ret;
 
     ts_realtime(&wb->gentime);
-    wb->network_diff = diff_from_nbits(wb->headerbin + 72);
+    wb->network_diff = diff_from_nbits((uchar *)(wb->headerbin + 72));
     LOGDEBUG("gbt network diff: %1.3lf", wb->network_diff);
     if (!ckp->proxy) {
         pool_stats_t *stats = &ckp_sdata->stats;
@@ -1486,20 +1505,17 @@ static void add_base(pool_t *ckp, sdata_t *sdata, workbase_t *wb, bool *new_bloc
         wb->mapped_id = wb->id = sdata->workbase_id++;
     else
         sdata->workbase_id = wb->id;
+    mutex_lock(&sdata->last_hash_lock);
     if (strncmp(wb->prevhash, sdata->lasthash, 64)) {
-        char bin[32], swap[32];
-
         *new_block = true;
+        // now copy the bin data and hexify it
         memcpy(sdata->lasthash, wb->prevhash, 65);
-        hex2bin(bin, sdata->lasthash, 32);
-        swap_256(swap, bin);
-        {
-            mutex_lock(&sdata->last_hash_lock);
-            __bin2hex(sdata->lastswaphash, swap, 32);
-            mutex_unlock(&sdata->last_hash_lock);
-        }
+        hex2bin(sdata->lasthashbin, sdata->lasthash, 32);
+        swap_256(sdata->lastswaphashbin, sdata->lasthashbin);
+        __bin2hex(sdata->lastswaphash, sdata->lastswaphashbin, 32);
         sdata->blockchange_id = wb->id;
     }
+    mutex_unlock(&sdata->last_hash_lock);
     if (*new_block && ckp->logshares) {
         sprintf(wb->logdir, "%s%08x/", ckp->logdir, wb->height);
         ret = mkdir(wb->logdir, 0750);
@@ -1568,7 +1584,7 @@ static void submit_transaction(pool_t *ckp, const char *hash)
 /* Build a hashlist of all transactions, allowing us to compare with the list of
  * existing transactions to determine which need to be propagated */
 static bool add_txn(pool_t *ckp, sdata_t *sdata, txntable_t **txns, const char *hash,
-            const char *data, bool local)
+                    const char *data, bool local)
 {
     bool found = false;
     txntable_t *txn;
@@ -1754,16 +1770,18 @@ static txntable_t *wb_merkle_bin_txns(pool_t *ckp, sdata_t *sdata, workbase_t *w
     txntable_t *txns = NULL;
     json_t *arr_val;
     uchar *hashbin;
+    const int64_t t0 = time_micros();
 
     wb->txns = json_array_size(txn_array);
     wb->merkles = 0;
     binlen = (long)wb->txns * 32L + 32L;
-    hashbin = alloca(binlen + 32L);
+    hashbin = ckalloc(binlen + 32L);
     memset(hashbin, 0, 32);
     binleft = binlen / 32L;
-    if (wb->txns) {
+    if (wb->txns > 0) {
         int len = 1, ofs = 0, length, max_len;
         const char *txn;
+        int hex_lengths[wb->txns];
 
         for (i = 0; i < wb->txns; i++) {
             arr_val = json_array_get(txn_array, i);
@@ -1772,9 +1790,8 @@ static txntable_t *wb_merkle_bin_txns(pool_t *ckp, sdata_t *sdata, workbase_t *w
                 LOGWARNING("json_string_value fail - cannot find transaction data");
                 goto out;
             }
-            length = strlen(txn);
+            hex_lengths[i] = length = strlen(txn);
             len += length;
-            json_set_int(arr_val, "length", length);
         }
         max_len = len;
 
@@ -1792,7 +1809,7 @@ static txntable_t *wb_merkle_bin_txns(pool_t *ckp, sdata_t *sdata, workbase_t *w
             // Post-segwit, txid returns the tx hash without witness data
             txid = json_string_value(json_object_get(arr_val, "txid"));
             hash = json_string_value(json_object_get(arr_val, "hash"));
-            length = json_integer_value(json_object_get(arr_val, "length"));
+            length = hex_lengths[i];
             len += length;
             if (!txid)
                 txid = hash;
@@ -1838,6 +1855,8 @@ static txntable_t *wb_merkle_bin_txns(pool_t *ckp, sdata_t *sdata, workbase_t *w
     LOGNOTICE("Stored %s workbase with %d transactions", local ? "local" : "remote",
               wb->txns);
 out:
+    free(hashbin);
+    LOGDEBUG("%s: took %1.6f secs", __func__, (time_micros()-t0) / 1e6);
     return txns;
 }
 
@@ -1960,6 +1979,17 @@ static void check_unconfirmed(pool_t *ckp, sdata_t *sdata, const int height)
     dealloc(found);
 }
 
+static time_t _sdata_get_update_time_safe(sdata_t *sdata, time_t *last_newblock_time)
+{
+    time_t update_time;
+    mutex_lock(&sdata->update_time_lock);
+    update_time = sdata->update_time;
+    if (last_newblock_time)
+        *last_newblock_time = sdata->last_newblock_time;
+    mutex_unlock(&sdata->update_time_lock);
+    return update_time;
+}
+
 /* This function assumes it will only receive a valid json gbt base template
  * since checking should have been done earlier, and creates the base template
  * for generating work templates. This is a ckmsgq so all uses of this function
@@ -1973,13 +2003,8 @@ static void block_update(pool_t *ckp, int *prio)
     bool ret = false;
     txntable_t *txns;
     workbase_t *wb;
-    time_t update_time;
-
-    {
-        mutex_lock(&sdata->update_time_lock);
-        update_time = sdata->update_time;
-        mutex_unlock(&sdata->update_time_lock);
-    }
+    const time_t update_time = _sdata_get_update_time_safe(sdata, NULL);
+    const int64_t t0 = time_micros();
 
     /* Skip update if we're getting stacked low priority updates too close
      * together. */
@@ -2020,7 +2045,7 @@ retry:
     if (new_block) {
 #define DECLARE_GET_LASTSWAPHASH_THREADSAFE(varname, sdata) \
         mutex_lock(&sdata->last_hash_lock); \
-        const char * const varname = strdupa(sdata->lastswaphash); \
+        const char * const varname = strdupa(sdata->lastswaphash ? : ""); \
         mutex_unlock(&sdata->last_hash_lock)
         DECLARE_GET_LASTSWAPHASH_THREADSAFE(lastswaphash, sdata);
         LOGNOTICE("Block hash changed to %s", lastswaphash);
@@ -2037,11 +2062,14 @@ retry:
      * forward the next notify in case of a new block. */
     mutex_lock(&sdata->update_time_lock);
     sdata->update_time = time(NULL);
-    if (new_block)
+    if (new_block) {
+        sdata->last_newblock_time = sdata->update_time;
         sdata->update_time -= ckp->update_interval / 2;
-    update_time = sdata->update_time;
+    }
     mutex_unlock(&sdata->update_time_lock);
 out:
+
+    LOGDEBUG("%s: took %1.6f secs", __func__, (time_micros() - t0)/1e6);
 
     cksem_post(&sdata->update_sem);
 
@@ -2463,7 +2491,6 @@ share_diff(char *coinbase, const uchar *enonce1bin, const workbase_t *wb, const 
 {
     unsigned char merkle_root[32], merkle_sha[64];
     uint32_t *data32, *swap32, benonce32;
-    uchar hash1[32];
     char data[80];
     int i;
 
@@ -2476,9 +2503,9 @@ share_diff(char *coinbase, const uchar *enonce1bin, const workbase_t *wb, const 
     memcpy(coinbase + *cblen, wb->coinb2bin, wb->coinb2len);
     *cblen += wb->coinb2len;
 
-    gen_hash((uchar *)coinbase, merkle_root, *cblen);
+    gen_hash((const uchar *)coinbase, merkle_root, *cblen);
     memcpy(merkle_sha, merkle_root, 32);
-    for (i = 0; i < wb->merkles && i < GENWORK_MAX_MERKLE_DEPTH; i++) {
+    for (i = 0; i < wb->merkles && i < GENWORK_MAX_MERKLE_DEPTH; ++i) {
         memcpy(merkle_sha + 32, &wb->merklebin[i], 32);
         gen_hash(merkle_sha, merkle_root, 64);
         memcpy(merkle_sha, merkle_root, 32);
@@ -2511,8 +2538,7 @@ share_diff(char *coinbase, const uchar *enonce1bin, const workbase_t *wb, const 
     data32 = (uint32_t *)data;
     swap32 = (uint32_t *)swap;
     flip_80(swap32, data32);
-    sha256(swap, 80, hash1);
-    sha256(hash1, 32, hash);
+    gen_hash(swap, hash, 80);
 
     /* Calculate the diff of the share here */
     return diff_from_target(hash);
@@ -2965,11 +2991,11 @@ static sdata_t *duplicate_sdata(const sdata_t *sdata)
     dsdata->ckp = sdata->ckp;
 
     /* Copy the transaction binaries for workbase creation */
-    memcpy(dsdata->txnbin, sdata->txnbin, 48);
-    dsdata->txnlen = sdata->txnlen;
+    memcpy(dsdata->scriptbin, sdata->scriptbin, GENERATOR_MAX_CSCRIPT_LEN);
+    dsdata->scriptlen = sdata->scriptlen;
     for (int i = 0; i < DONATION_NUM_ADDRESSES; ++i) {
-        memcpy(dsdata->donation_data[i].txnbin, sdata->donation_data[i].txnbin, 48);
-        dsdata->donation_data[i].txnlen = sdata->donation_data[i].txnlen;
+        memcpy(dsdata->donation_data[i].scriptbin, sdata->donation_data[i].scriptbin, GENERATOR_MAX_CSCRIPT_LEN);
+        dsdata->donation_data[i].scriptlen = sdata->donation_data[i].scriptlen;
     }
 
     /* Use the same work queues for all subproxies */
@@ -4333,10 +4359,11 @@ static void block_solve(pool_t *ckp, json_t *val)
     int height = 0;
     ts_t ts_now;
 
-    if (!ckp->node && !ckp->n_notify_btcds) {
-        /* We only update_base if !node and if we are not using a notifier otherwise we rely on
-        the notifier to call update_base() for us and this call would be redundant. */
-        update_base(sdata, GEN_PRIORITY);
+    if (!ckp->node) {
+        // if we have notifiers, request an update_base at lower priority since
+        // presumably the notifier will also request an update_base at GEN_PRIORITY
+        // around this time, and we don't want to spam update_base().
+        update_base(sdata, ckp->n_notify_btcds ? GEN_NORMAL : GEN_PRIORITY);
     }
 
     ts_realtime(&ts_now);
@@ -4563,11 +4590,12 @@ static json_t *userinfo(const user_instance_t *user)
 {
     json_t *val;
 
-    JSON_CPACK(val, "{ss,si,si,sf,sf,sf,sf,sf,sf,si}",
-           "user", user->username, "id", user->id, "workers", user->workers,
-        "bestdiff", user->best_diff, "dsps1", user->dsps1, "dsps5", user->dsps5,
-        "dsps60", user->dsps60, "dsps1440", user->dsps1440, "dsps10080", user->dsps10080,
-        "lastshare", user->last_share.tv_sec);
+    JSON_CPACK(val, "{ss,si,si,sf,sf,sf,sf,sf,sf,sf,si}",
+               "user", user->username, "id", user->id, "workers", user->workers,
+               "bestdiff", user->best_diff,  "bestdiff_alltime", user->best_diff_alltime,
+               "dsps1", user->dsps1, "dsps5", user->dsps5, "dsps60", user->dsps60,
+               "dsps1440", user->dsps1440, "dsps10080", user->dsps10080,
+               "lastshare", user->last_share.tv_sec);
     return val;
 }
 
@@ -4684,11 +4712,12 @@ static json_t *workerinfo(const user_instance_t *user, const worker_instance_t *
 {
     json_t *val;
 
-    JSON_CPACK(val, "{ss,ss,si,sf,sf,sf,sf,si,sf,si,sb}",
-           "user", user->username, "worker", worker->workername, "id", user->id,
-        "dsps1", worker->dsps1, "dsps5", worker->dsps5, "dsps60", worker->dsps60,
-        "dsps1440", worker->dsps1440, "lastshare", worker->last_share.tv_sec,
-        "bestdiff", worker->best_diff, "mindiff", worker->mindiff, "idle", worker->idle);
+    JSON_CPACK(val, "{ss,ss,si,sf,sf,sf,sf,si,sf,sf,si,sb}",
+               "user", user->username, "worker", worker->workername, "id", user->id,
+               "dsps1", worker->dsps1, "dsps5", worker->dsps5, "dsps60", worker->dsps60,
+               "dsps1440", worker->dsps1440, "lastshare", worker->last_share.tv_sec,
+               "bestdiff", worker->best_diff, "bestdiff_alltime", worker->best_diff_alltime,
+               "mindiff", worker->mindiff, "idle", worker->idle);
     return val;
 }
 
@@ -4788,6 +4817,7 @@ static json_t *clientinfo(const stratum_instance_t *client)
     json_set_int(val, "userid", client->user_id);
     json_set_int(val, "server", client->server);
     json_set_double(val, "bestdiff", client->best_diff);
+    json_set_double(val, "bestdiff_alltime", client->best_diff_alltime);
     json_set_int(val, "proxyid", client->proxyid);
     json_set_int(val, "subproxyid", client->subproxyid);
 
@@ -5049,15 +5079,26 @@ static void get_poolstats(sdata_t *sdata, int *sockd)
     json_t *val;
 
     mutex_lock(&sdata->stats_lock);
-    JSON_CPACK(val, "{si,si,si,si,si,sI,sf,sf,sf,sf,sI,sI,sf,sf,sf,sf,sf,sf,sf}",
-           "start", stats->start_time.tv_sec, "update", stats->last_update.tv_sec,
-        "workers", stats->workers + stats->remote_workers, "users", stats->users + stats->remote_users,
-        "disconnected", stats->disconnected,
-        "shares", stats->accounted_shares, "sps1", stats->sps1, "sps5", stats->sps5,
-        "sps15", stats->sps15, "sps60", stats->sps60, "accepted", stats->accounted_diff_shares,
-        "rejected", stats->accounted_rejects, "dsps1", stats->dsps1, "dsps5", stats->dsps5,
-        "dsps15", stats->dsps15, "dsps60", stats->dsps60, "dsps360", stats->dsps360,
-        "dsps1440", stats->dsps1440, "dsps10080", stats->dsps10080);
+    JSON_CPACK(val, "{sI,sI,si,si,si,sI,sf,sf,sf,sf,sI,sI,sf,sf,sf,sf,sf,sf,sf}",
+               "start", (json_int_t)stats->start_time.tv_sec,
+               "update", (json_int_t)stats->last_update.tv_sec,
+               "workers", stats->workers + stats->remote_workers,
+               "users", stats->users + stats->remote_users,
+               "disconnected", stats->disconnected,
+               "shares", (json_int_t)stats->accounted_shares,
+               "sps1", stats->sps1,
+               "sps5", stats->sps5,
+               "sps15", stats->sps15,
+               "sps60", stats->sps60,
+               "accepted", stats->accounted_diff_shares,
+               "rejected", stats->accounted_rejects,
+               "dsps1", stats->dsps1,
+               "dsps5", stats->dsps5,
+               "dsps15", stats->dsps15,
+               "dsps60", stats->dsps60,
+               "dsps360", stats->dsps360,
+               "dsps1440", stats->dsps1440,
+               "dsps10080", stats->dsps10080);
     mutex_unlock(&sdata->stats_lock);
 
     send_api_response(val, *sockd);
@@ -5270,7 +5311,7 @@ static void *blockupdate(void *arg)
     while (42) {
         int ret;
 
-        ret = generator_getbest(ckp, hash);
+        ret = generator_getbest(ckp, hash, false);
         switch (ret) {
             case GETBEST_NOTIFY:
                 cksleep_ms(5000);
@@ -5290,128 +5331,262 @@ static void *blockupdate(void *arg)
     return NULL;
 }
 
+static bool _zmq_check_file_exists_if_ipc(const char *endpoint)
+{
+    bool ret = true;
+    char *proto = NULL, *port = NULL, *path = NULL;
+    if (extract_zmq_proto_port(endpoint, &proto, &port, &path)) {
+        if (strcasecmp(proto, "ipc") == 0 && path) {
+            struct stat stbuf;
+            if (stat(path, &stbuf)) {
+                LOGERR("ZMQ: stat error: %s", path);
+                ret = false;
+            } else if ((stbuf.st_mode & S_IFMT) != S_IFSOCK) {
+                LOGWARNING("ZMQ: not a socket: %s", path);
+                ret = false;
+            } else {
+                LOGDEBUG("ZMQ: ipc socket found ok on filesystem: %s", endpoint);
+            }
+        }
+        free(path);
+        free(proto);
+        free(port);
+    } else {
+        LOGWARNING("ZMQ: failed to parse ZMQ protocol for endpoint: %s", endpoint);
+    }
+    return ret;
+}
 
-// this thread is only created only if ckp->n_zmq_btcds > 0
+static void *_zmq_create_sub_socket_with_backoff(void *context, const char *endpoint, const char *topic, int num)
+{
+    void *zs = NULL;
+    int64_t start = time_micros();
+    static const int64_t timeout = 90 * 1000 * 1000; // we do this max for 90 seconds before quitting
+    useconds_t backoff = 512U * 1000U; // start off at 512ms
+    while (1) { // keep retrying to create the socket. We employ our backoff strategy.
+        zs = zmq_socket(context, ZMQ_SUB);
+        if (!zs) {
+            LOGWARNING("ZMQ: zmq_socket #%d failed with errno %d", num+1, errno);
+        } else {
+            int rc = zmq_setsockopt(zs, ZMQ_SUBSCRIBE, topic, 0);
+            if (rc < 0) {
+                LOGWARNING("ZMQ: zmq_setsockopt #%d failed with errno %d for \"%s\"", num+1, errno, topic);
+            } else {
+                rc = zmq_connect(zs, endpoint);
+                if (rc < 0)
+                    LOGWARNING("ZMQ: zmq_connect #%d to %s failed with errno %d", num+1, endpoint, errno);
+                else
+                    return zs; // success!
+            }
+        }
+        if (zs) {
+            zmq_close(zs);
+            zs = NULL;
+        }
+        if (time_micros() - start > timeout)
+            quit(1, "ZMQ: could not create a socket to %s for \"%s\" after %ld seconds", endpoint, topic, (long)(timeout / 1000000LL));
+        else
+            LOGERR("ZMQ: retrying for %s, sleeping %u useconds ...", endpoint, (unsigned)backoff);
+        usleep(backoff);
+        backoff *= 2U;
+    }
+
+}
+
+// ZMQ notify thread: created only if ckp->n_zmq_btcds > 0,
+// i.e. if at least 1 bitcoind is giving us ZMQ notifications.
 static void *zmqnotify(void *arg)
 {
     pthread_detach(pthread_self());
     rename_proc("zmqnotify");
-
     LOGINFO("ZMQ: thread started");
 
-    pool_t *ckp = (pool_t *)arg;
-    sdata_t *sdata = ckp->sdata;
+    /* This function listens for "hashblock" pub messages from bitcoind and
+    notifies the rest of the system about block hash changes, via update_base().
+
+    ZMQ is unreliable -- a socket may die with no way to know it is dead. As
+    such, we must employ a strategy to auto-detect whether we haven't heard from
+    ZMQ in some time.  We use the following rules:
+
+    1. If no ZMQ message has ever been received since thread creation, reset
+       and re-create the ZMQ sockets after 20 minutes of inactivity.
+    2. If we have received at least 1 ZMQ message since thread creation, then we
+       tolerate up to ~30 secs of delay between the time update_base() has last
+       seen a block hash change and when ZMQ receives the notification (usually
+       ZMQ sees it first, but it may not always do so).
+
+    In this way, dead ZMQ sockets eventually get reset and re-created.
+
+    Limitations of the above: Currently we don't detect whether a particular
+    socket is dead, only if all of them are.  So if using more than 1 bitcoind
+    with more thant 1 ZMQ socket, the above logic only resets all the sockets if
+    no ZMQ messages have arrived from any bitcoind in some time.  For now, the
+    above is an acceptable limitation to keep the below code simpler. */
+
+    static const char * const subtopic = "hashblock"; /* Note: this is hard-coded in bitcoind. However, some day you do change this string, you will need to modify the case 9: in the switch towards the end of this function */
+    pool_t * const ckp = (pool_t *)arg;
+    sdata_t * const sdata = ckp->sdata;
+    const int POLL_INTERVAL_MS = ckp->update_interval*1000; // poll timeout is stratum update interval
+    static const int MAX_FAILURES = 10; // print stern warnings to log if failure_ct exceeds this value
+    int failure_ct = 0;
+    static const time_t one_minute = 60; // used in detecting dead ZMQ
+    time_t last_seen_zmq_block = 0, last_reset = 0;
+
+    bool endpoints_initted = false;
     const int N = ckp->n_zmq_btcds; // the number of elements in the above arrays
     assert(N > 0); // this thread should only be created if it has at least 1 btcdzmqblock endpoint to monitor
+
+    void *context = zmq_ctx_new();
+    assert(context);
+
+    uint8_t last_hash_seen[32] = {};
 
     // allocate dynamic structures for each btcd endpoint we plan to poll
     const char *endpoints[N];
     zmq_pollitem_t poll_items[N];
     memset(endpoints, 0, N * sizeof(*endpoints));
-    memset(poll_items, 0, N * sizeof(*poll_items));
+    // poll_items[] will be zero-initted in for() loop below
 
-    void *context = zmq_ctx_new();
-    int rc;
+    do {
+        bool reset_sockets = false;
 
-    assert(context);
-    for (int i = 0, btcdidx = 0; i < N; ++i) {
-        const char *endpoint = NULL;
-        for ( ; !endpoint && btcdidx < ckp->btcds; ++btcdidx) {
-            // find the btcd corresponding to this zmq index i
-            endpoint = ckp->btcdzmqblock[btcdidx];
-        }
-        if (unlikely(!endpoint)) {
-            // this should never happen. It indicates a programming error if it does.
-            quit(1, "ZMQ: INTERNAL ERROR: Could not find the endpoint entry #%d in config!", i+1);
-        }
-        endpoints[i] = endpoint;
-        void *zs = zmq_socket(context, ZMQ_SUB);
-        if (!zs)
-            quit(1, "zmq_socket #%d failed with errno %d", i+1, errno);
-        rc = zmq_setsockopt(zs, ZMQ_SUBSCRIBE, "hashblock", 0);
-        if (rc < 0)
-            quit(1, "zmq_setsockopt #%d failed with errno %d", i+1, errno);
-        rc = zmq_connect(zs, endpoint);
-        if (rc < 0)
-            quit(1, "zmq_connect #%d to %s failed with errno %d", i+1, endpoint, errno);
-        LOGNOTICE("ZMQ: subscribed #%d to %s for \"hashblock\"", i+1, endpoint);
-        poll_items[i].socket = zs;
-        poll_items[i].events = ZMQ_POLLIN;
-    }
-
-    uint8_t last_hash_seen[32] = {};
-
-    while (1) {
-        int num_ready = zmq_poll(poll_items, N, -1);
-        if (num_ready < 0) {
-            LOGWARNING("ZMQ: got error return from zmq_poll with errno %d", errno);
-            sleep(5);
-            continue;
-        }
-        for (int i = 0; i < N && num_ready; ++i) {
-            if (poll_items[i].revents & ZMQ_POLLIN) {
-                --num_ready;
-                const char * const endpoint = endpoints[i];
-                LOGDEBUG("ZMQ: %s #%d was ready, num_ready now: %d", endpoint, i+1, num_ready);
-                // do stuff with sock
-                void *zs = poll_items[i].socket;
-                bool keeptrying;
-                do {
-                    zmq_msg_t message;
-
-                    zmq_msg_init(&message);
-                    rc = zmq_msg_recv(&message, zs, ZMQ_DONTWAIT);
-
-                    keeptrying = false;
-
-                    if (rc < 0) {
-                        if (likely(errno == EAGAIN)) {
-                            LOGDEBUG("ZMQ: zmq_msg_recv on %s #%d got EAGAIN ...", endpoint, i+1);
-                        } else {
-                            LOGWARNING("ZMQ: zmq_msg_recv on %s #%d failed with error %d", endpoint, i+1, errno);
-                            sleep(1);
-                        }
-                    } else {
-                        int size = zmq_msg_size(&message);
-
-                        keeptrying = true;
-
-                        switch (size) {
-                        case 9:
-                            LOGDEBUG("ZMQ: %s #%d hashblock message", endpoint, i+1);
-                            break;
-                        case 4:
-                            LOGDEBUG("ZMQ: %s #%d sequence number", endpoint, i+1);
-                            break;
-                        case 32: {
-                            char hexhash[65];
-                            const void *msg_data = zmq_msg_data(&message);
-                            const bool is_new = memcmp(last_hash_seen, msg_data, 32) != 0;
-                            memcpy(last_hash_seen, msg_data, 32);
-                            __bin2hex(hexhash, msg_data, 32);
-                            LOGNOTICE("ZMQ: %s #%d - block hash: %s - is_new: %s", endpoint, i+1, hexhash,
-                                      is_new ? "yes" : "no");
-                            if (is_new)
-                                update_base(sdata, GEN_PRIORITY);
-                            break;
-                        }
-                        default:
-                            LOGWARNING("ZMQ: %s #%d message size error, size = %d!", endpoint, i+1, size);
-                            break;
-                        }
-                        if (!zmq_msg_more(&message)) {
-                            LOGDEBUG("ZMQ: %s #%d message complete", endpoint, i+1);
-                        }
-                    }
-
-                    zmq_msg_close(&message);
-                } while (keeptrying);
+        for (int i = 0, btcdidx = 0; i < N; ++i) {
+            const char *endpoint = NULL;
+            if (!endpoints_initted) {
+                // first time running through this init code, set up the endpoints pointers
+                for ( ; !endpoint && btcdidx < ckp->btcds; ++btcdidx) {
+                    // find the btcd corresponding to this zmq index i
+                    endpoint = ckp->btcdzmqblock[btcdidx];
+                }
+                if (unlikely(!endpoint)) {
+                    // this should never happen. It indicates a programming error if it does.
+                    quit(1, "ZMQ: INTERNAL ERROR: Could not find the endpoint entry #%d in config!", i+1);
+                }
+                if (unlikely(!_zmq_check_file_exists_if_ipc(endpoint))) {
+                    // this is paranoia -- presumably if admin went to the trouble to set up ZMQ via IPC,
+                    // they care about reliability. So,we need to make sure that we can access it.
+                    quit(1, "ZMQ: IPC socket specified but failed to access it on the filesystem: %s", endpoint);
+                }
+                endpoints[i] = endpoint;
+            } else {
+                // subsequent times running through this init code, we already have the
+                // endpoints array set up, just grab the pointer
+                endpoint = endpoints[i];
             }
-            poll_items[i].revents = 0;
+            memset(&poll_items[i], 0, sizeof(poll_items[i]));
+            poll_items[i].socket = _zmq_create_sub_socket_with_backoff(context, endpoint, subtopic, i);
+            poll_items[i].events = ZMQ_POLLIN;
+            LOGNOTICE("ZMQ: socket #%d to %s for \"%s\" created", i+1, endpoint, subtopic);
         }
-    }
-    for (int i = 0; i < N; ++i)
-        zmq_close(poll_items[i].socket);
+        last_reset = time(NULL);
+        endpoints_initted = true;
+
+        while (!reset_sockets) {
+            int num_ready = zmq_poll(poll_items, N, POLL_INTERVAL_MS);
+            if (unlikely(failure_ct > MAX_FAILURES && num_ready < 1)) {
+                LOGWARNING("ZMQ: failure threshold hit (failure_ct=%d)", failure_ct);
+            }
+            if (unlikely(num_ready < 0)) {
+                reset_sockets = true;
+                LOGCRIT("ZMQ: got error return from zmq_poll");
+                sleep(5);
+                ++failure_ct;
+                break;
+            } else if (num_ready == 0) {
+                time_t last_newblock = 0;
+                _sdata_get_update_time_safe(sdata, &last_newblock);
+                if ( ( (last_seen_zmq_block && abs(last_newblock - last_seen_zmq_block) > one_minute)
+                       || (!last_seen_zmq_block && abs(time(NULL) - last_newblock) > 20 * one_minute))
+                     && abs(time(NULL) - last_reset) > 2 * one_minute ) {
+                    LOGWARNING("ZMQ: zmq socket(s) idle, recreating them to enure they are still valid");
+                    reset_sockets = true;
+                    ++failure_ct;
+                } else {
+                    //LOGDEBUG("ZMQ: no new blocks after %1.1f secs, waiting ...", POLL_INTERVAL_MS/1e3);
+                }
+                continue;
+            }
+            for (int i = 0; i < N && num_ready > 0; ++i) {
+                if (poll_items[i].revents & ZMQ_POLLIN) {
+                    --num_ready;
+                    const char * const endpoint = endpoints[i];
+                    LOGDEBUG("ZMQ: %s #%d was ready, num_ready now: %d", endpoint, i+1, num_ready);
+                    // do stuff with sock
+                    void *zs = poll_items[i].socket;
+                    bool keeptrying;
+                    do {
+                        zmq_msg_t message;
+
+                        zmq_msg_init(&message);
+                        int rc = zmq_msg_recv(&message, zs, ZMQ_DONTWAIT);
+
+                        keeptrying = false;
+
+                        if (rc < 0) {
+                            if (likely(errno == EAGAIN)) {
+                                LOGDEBUG("ZMQ: zmq_msg_recv on %s #%d got EAGAIN ...", endpoint, i+1);
+                            } else {
+                                LOGCRIT("ZMQ: zmq_msg_recv on %s #%d failed", endpoint, i+1);
+                                sleep(1);
+                            }
+                            ++failure_ct;
+                        } else {
+                            const int size = zmq_msg_size(&message);
+                            const void * const msg_data = size > 0 ? zmq_msg_data(&message) : NULL;
+
+                            keeptrying = true;
+                            failure_ct = 0;
+
+                            switch (size) {
+                            case 9:
+                                LOGDEBUG("ZMQ: %s #%d message: %.*s", endpoint, i+1, 9, (const char *)msg_data);
+                                break;
+                            case 4: {
+                                int32_t num;
+                                memcpy(&num, msg_data, 4);
+                                LOGDEBUG("ZMQ: %s #%d sequence number: %d", endpoint, i+1, (int)num);
+                                break;
+                            }
+                            case 32: {
+                                uint8_t lastswaphashbin[32];
+                                {
+                                    mutex_lock(&sdata->last_hash_lock);
+                                    memcpy(lastswaphashbin, sdata->lastswaphashbin, 32);
+                                    mutex_unlock(&sdata->last_hash_lock);
+                                }
+                                const bool is_new = memcmp(last_hash_seen, msg_data, 32) != 0;
+                                const bool need_update = memcmp(lastswaphashbin, msg_data, 32) != 0;
+                                if (is_new)
+                                    memcpy(last_hash_seen, msg_data, 32);
+                                char hexhash[65];
+                                __bin2hex(hexhash, msg_data, 32);
+                                LOGNOTICE("ZMQ: %s #%d - block hash: %s - is_new: %s need_update: %s", endpoint, i+1, hexhash,
+                                          is_new ? "yes" : "no", need_update ? "yes" : "no");
+                                if (need_update)
+                                    update_base(sdata, GEN_PRIORITY);
+                                last_seen_zmq_block = time(NULL);
+                                break;
+                            }
+                            default:
+                                LOGWARNING("ZMQ: %s #%d message size error, size = %d!", endpoint, i+1, size);
+                                break;
+                            }
+                            if (!zmq_msg_more(&message)) {
+                                LOGDEBUG("ZMQ: %s #%d message complete", endpoint, i+1);
+                            }
+                        }
+
+                        zmq_msg_close(&message);
+                    } while (keeptrying);
+                }
+                poll_items[i].revents = 0;
+            }
+        } // while(!reset_sockets)
+        for (int i = 0; i < N; ++i) {
+            zmq_close(poll_items[i].socket);
+            poll_items[i].socket = NULL;
+        }
+    } while (1);
     zmq_ctx_destroy(context);
 
     return NULL;
@@ -5944,13 +6119,20 @@ static void read_userstats(pool_t *ckp, sdata_t *sdata, int tvsec_diff)
         user->last_share.tv_sec = lastshare;
         json_get_int64(&user->shares, val, "shares");
         json_get_double(&user->best_diff, val, "bestshare");
+        json_get_double(&user->best_diff_alltime, val, "bestshare_alltime");
         json_get_double(&user->accumulated, val, "accumulated");
         json_get_int(&user->postponed, val, "postponed");
         json_get_double(&user->herp, val, "herp");
         json_get_double(&user->lns, val, "lns");
-        LOGDEBUG("Successfully read user %s stats %f %f %f %f %f %f %f %f", username,
-            user->dsps1, user->dsps5, user->dsps60, user->dsps1440,
-            user->dsps10080, user->best_diff, user->herp, user->lns);
+        if (user->best_diff > user->best_diff_alltime) {
+            // bestshare_alltime was added later, so old data files may not have this
+            // so ensure that this field is at least >= bestshare
+            user->best_diff_alltime = user->best_diff;
+        }
+        LOGDEBUG("Successfully read user %s stats %f %f %f %f %f %f %f %f %f", username,
+                 user->dsps1, user->dsps5, user->dsps60, user->dsps1440,
+                 user->dsps10080, user->best_diff, user->best_diff_alltime,
+                 user->herp, user->lns);
         if (tvsec_diff > 60)
             decay_user(user, 0, &now);
 
@@ -5980,12 +6162,18 @@ static void read_userstats(pool_t *ckp, sdata_t *sdata, int tvsec_diff)
             json_get_int(&lastshare, arr_val, "lastshare");
             worker->last_share.tv_sec = lastshare;
             json_get_double(&worker->best_diff, arr_val, "bestshare");
+            json_get_double(&worker->best_diff_alltime, arr_val, "bestshare_alltime");
             json_get_int64(&worker->shares, arr_val, "shares");
             json_get_double(&worker->herp, arr_val, "herp");
             json_get_double(&worker->lns, arr_val, "lns");
-            LOGDEBUG("Successfully read worker %s stats %f %f %f %f %f %f %f",
-                 worker->workername, worker->dsps1, worker->dsps5, worker->dsps60,
-                     worker->dsps1440, worker->best_diff, worker->herp, worker->lns);
+            if (worker->best_diff > worker->best_diff_alltime) {
+                // migrate
+                worker->best_diff_alltime = worker->best_diff;
+            }
+            LOGDEBUG("Successfully read worker %s stats %f %f %f %f %f %f %f %f",
+                     worker->workername, worker->dsps1, worker->dsps5, worker->dsps60,
+                     worker->dsps1440, worker->best_diff, worker->best_diff_alltime,
+                     worker->herp, worker->lns);
             if (tvsec_diff > 60)
                 decay_worker(worker, 0, &now);
         }
@@ -6024,25 +6212,6 @@ static user_instance_t *__create_user(sdata_t *sdata, const char *username)
     return user;
 }
 
-// Attempt to parse the address for the user based on username, if that fails, then
-// fall back to pool address.  In the unlikely case that also fails, quits immediately.
-static void cache_user_address_cscript(pool_t *ckp, user_instance_t *user, const char *username)
-{
-    user->txnlen = address_to_txn(user->txnbin, username, user->script, ckp->cashaddr_prefix);
-    if (!user->txnlen) {
-        if (ckp->bchaddress) {
-            user->txnlen = address_to_txn(user->txnbin, ckp->bchaddress, ckp->script, ckp->cashaddr_prefix);
-        }
-        if (user->txnlen) {
-            LOGWARNING("Failed to parse user address '%s', fell back to using pool address '%s'", username, ckp->bchaddress ? : "");
-        } else {
-            quit(1, "Failed to parse user address '%s', and fallback of pool address '%s' also failed to parse! FIXME!",
-                    username, ckp->bchaddress ? : "");
-        }
-    }
-
-}
-
 /* Find user by username or create one if it doesn't already exist */
 static user_instance_t *get_create_user(sdata_t *sdata, const char *username, bool *new_user)
 {
@@ -6065,11 +6234,8 @@ static user_instance_t *get_create_user(sdata_t *sdata, const char *username, bo
 
     /* Is this a bch address based username? */
     if (!ckp->proxy && (*new_user || !user->bchaddress)) {
-        user->bchaddress = generator_checkaddr(ckp, username, &user->script);
-        if (user->bchaddress) {
-            /* Cache the transaction for use in generation */
-            cache_user_address_cscript(ckp, user, username); //< may quit here if no valid pool address (ckp->bchaddress).
-        }
+        user->scriptlen = generator_checkaddr(ckp, username, user->scriptbin);
+        user->bchaddress = user->scriptlen != 0;
     }
 
     return user;
@@ -6750,8 +6916,8 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
     if (likely(diff < sdata->current_workbase->network_diff * 0.999))
         return;
 
-    LOGWARNING("Possible %sblock solve diff %lf (network diff: %lf) !", stale ? "stale share " : "", diff,
-               sdata->current_workbase->network_diff);
+    LOGWARNING("Possible %sblock solve diff %lf (network diff: %lf) !", stale ? "stale share " : "",
+               diff, sdata->current_workbase->network_diff);
     /* Can't submit a block in proxy mode without the transactions */
     if (!ckp->node && wb->proxy)
         return;
@@ -6809,7 +6975,7 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
         FILE *fp;
 
         blockval = json_copy(wb->payout);
-        json_set_string(blockval, "solvedby", client->user_instance->username);
+        json_set_string(blockval, "solvedby", client->workername ? : client->user_instance->username);
         get_timestamp(stamp);
         json_set_string(blockval, "date", stamp);
         swap_256(swap256, flip32);
@@ -6821,6 +6987,8 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
         json_set_int64(blockval, "shares", shares);
         percent = round(shares * 1000 / wb->network_diff) / 10;
         json_set_double(blockval, "diff", percent);
+        json_set_double(blockval, "network_difficulty", sdata->current_workbase->network_diff);
+        json_set_double(blockval, "solution_difficulty", diff);
         blocksolve->val = json_copy(blockval);
         DL_APPEND(sdata->stats.unconfirmed, blocksolve);
         mutex_unlock(&sdata->stats_lock);
@@ -6832,7 +7000,7 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
             LOGERR("Failed to fopen %s", fname);
         } else {
             s = json_dumps(blockval, JSON_NO_UTF8 | JSON_PRESERVE_ORDER |
-                JSON_REAL_PRECISION(12) | JSON_INDENT(1) | JSON_EOL);
+                                     JSON_REAL_PRECISION(12) | JSON_INDENT(2) | JSON_EOL);
             fprintf(fp, "%s", s);
             free(s);
             fclose(fp);
@@ -6917,10 +7085,14 @@ static void check_best_diff(pool_t *ckp, sdata_t *sdata, user_instance_t *user,
 
     if (sdiff > worker->best_diff) {
         worker->best_diff = floor(sdiff);
+        if (worker->best_diff > worker->best_diff_alltime)
+            worker->best_diff_alltime = worker->best_diff;
         best_worker = true;
     }
     if (sdiff > user->best_diff) {
         user->best_diff = floor(sdiff);
+        if (user->best_diff > user->best_diff_alltime)
+            user->best_diff_alltime = user->best_diff;
         best_user = true;
     }
     if (likely(!CKP_STANDALONE(ckp) || (!best_user && !best_worker) || !client))
@@ -7057,8 +7229,10 @@ static json_t *parse_submit(stratum_instance_t *client, json_t *json_msg,
         worker_instance_t *worker = client->worker_instance;
 
         client->best_diff = floor(sdiff);
+        if (client->best_diff > client->best_diff_alltime)
+            client->best_diff_alltime = client->best_diff;
         LOGINFO("User %s worker %s client %s new best diff %lf", user->username,
-            worker->workername, client->identity, sdiff);
+                worker->workername, client->identity, sdiff);
         check_best_diff(ckp, sdata, user, worker, sdiff, client);
     }
     bswap_256(sharehash, hash);
@@ -9347,19 +9521,20 @@ static void *statsupdate(void *arg)
                 LOGDEBUG("Storing worker %s", worker->workername);
 
                 percent = round(worker->herp / worker->lns * 100) / 100;
-                JSON_CPACK(val, "{ss,ss,ss,ss,ss,ss,sI,sI,sf,sf,sf,sf}",
-                        "workername", worker->workername,
-                        "hashrate1m", suffix1,
-                        "hashrate5m", suffix5,
-                        "hashrate1hr", suffix60,
-                        "hashrate1d", suffix1440,
-                        "hashrate7d", suffix10080,
-                        "lastshare", (json_int_t)worker->last_share.tv_sec,
-                        "shares", (json_int_t)worker->shares,
-                        "bestshare", worker->best_diff,
-                        "lns", worker->lns,
-                        "luck", percent,
-                        "herp", worker->herp);
+                JSON_CPACK(val, "{ss,ss,ss,ss,ss,ss,sI,sI,sf,sf,sf,sf,sf}",
+                           "workername", worker->workername,
+                           "hashrate1m", suffix1,
+                           "hashrate5m", suffix5,
+                           "hashrate1hr", suffix60,
+                           "hashrate1d", suffix1440,
+                           "hashrate7d", suffix10080,
+                           "lastshare", (json_int_t)worker->last_share.tv_sec,
+                           "shares", (json_int_t)worker->shares,
+                           "bestshare", worker->best_diff,
+                           "bestshare_alltime", worker->best_diff_alltime,
+                           "lns", worker->lns,
+                           "luck", percent,
+                           "herp", worker->herp);
                 json_array_append_new(user_array, val);
                 val = NULL;
             }
@@ -9407,24 +9582,25 @@ static void *statsupdate(void *arg)
             derp /= SATOSHIS;
 
             percent = round(user->herp / user->lns * 100) / 100;
-            JSON_CPACK(val, "{ss,ss,ss,ss,ss,sI,si,sI,sf,sf,sf,sf,si,sf,sf,sI}",
-                    "hashrate1m", suffix1,
-                    "hashrate5m", suffix5,
-                    "hashrate1hr", suffix60,
-                    "hashrate1d", suffix1440,
-                    "hashrate7d", suffix10080,
-                    "lastshare", (json_int_t)user->last_share.tv_sec,
-                    "workers", user->workers + user->remote_workers,
-                    "shares", (json_int_t)user->shares,
-                    "bestshare", user->best_diff,
-                    "lns", user->lns,
-                    "luck", percent,
-                    "accumulated", user->accumulated,
-                    "postponed", user->postponed,
-                    "herp", user->herp,
-                    "derp", derp,
-                    // add timestamp for reference
-                    "time", (json_int_t)now.tv_sec);
+            JSON_CPACK(val, "{ss,ss,ss,ss,ss,sI,si,sI,sf,sf,sf,sf,sf,si,sf,sf,sI}",
+                       "hashrate1m", suffix1,
+                       "hashrate5m", suffix5,
+                       "hashrate1hr", suffix60,
+                       "hashrate1d", suffix1440,
+                       "hashrate7d", suffix10080,
+                       "lastshare", (json_int_t)user->last_share.tv_sec,
+                       "workers", user->workers + user->remote_workers,
+                       "shares", (json_int_t)user->shares,
+                       "bestshare", user->best_diff,
+                       "bestshare_alltime", user->best_diff_alltime,
+                       "lns", user->lns,
+                       "luck", percent,
+                       "accumulated", user->accumulated,
+                       "postponed", user->postponed,
+                       "herp", user->herp,
+                       "derp", derp,
+                       // add timestamp for reference
+                       "time", (json_int_t)now.tv_sec);
 
             if (user->remote_workers) {
                 remote_workers += user->remote_workers;
@@ -9438,7 +9614,7 @@ static void *statsupdate(void *arg)
 
             if (!inactive) {
                 s = json_dumps(val, JSON_NO_UTF8 | JSON_PRESERVE_ORDER |
-                    JSON_COMPACT | JSON_REAL_PRECISION(16));
+                                    JSON_COMPACT | JSON_REAL_PRECISION(16));
                 if (!idle) {
                     /* It's convenient to see the biggest hashers last
                      * when tail'ing the log as it's being written. */
@@ -9452,7 +9628,7 @@ static void *statsupdate(void *arg)
             json_object_set_new_nocheck(val, "worker", user_array);
             ASPRINTF(&fname, "%s/users/%s", ckp->logdir, user->username);
             s = json_dumps(val, JSON_NO_UTF8 | JSON_PRESERVE_ORDER | JSON_EOL |
-                 JSON_REAL_PRECISION(16) | JSON_INDENT(1));
+                                JSON_REAL_PRECISION(16) | JSON_INDENT(2));
             add_log_entry(&log_entries, &fname, &s);
             json_decref(val);
             if (ckp->remote)
@@ -9571,7 +9747,7 @@ static void *statsupdate(void *arg)
                 LOGERR("Failed to fopen %s", fname);
             } else {
                 s = json_dumps(val, JSON_NO_UTF8 | JSON_PRESERVE_ORDER |
-                    JSON_REAL_PRECISION(12) | JSON_INDENT(1) | JSON_EOL);
+                                    JSON_REAL_PRECISION(12) | JSON_INDENT(2) | JSON_EOL);
                 fprintf(fp, "%s", s);
                 dealloc(s);
                 fclose(fp);
@@ -9902,30 +10078,21 @@ void *stratifier(void *arg)
             goto out;
         }
 
-        if (!generator_checkaddr(ckp, ckp->bchaddress, &ckp->script)) {
-            LOGEMERG("Fatal: bchaddress invalid according to bitcoind");
-            goto out;
-        }
-
         /* Store this for use elsewhere */
         hex2bin(scriptsig_header_bin, scriptsig_header, 41);
-        sdata->txnlen = address_to_txn(sdata->txnbin, ckp->bchaddress, ckp->script, ckp->cashaddr_prefix);
-        if (!sdata->txnlen) {
-            LOGEMERG("Failed to parse pool address '%s'. FIXME!", ckp->bchaddress);
+
+        if (!(sdata->scriptlen = generator_checkaddr(ckp, ckp->bchaddress, sdata->scriptbin))) {
+            LOGEMERG("Fatal: bchaddress \"%s\" invalid according to bitcoind", ckp->bchaddress);
             goto out;
         }
 
         for (int i = 0; i < DONATION_NUM_ADDRESSES; ++i) {
-            if (generator_checkaddr(ckp, ckp->dev_donations[i].address, &ckp->dev_donations[i].isscript)) {
-                ckp->dev_donations[i].valid = true;
+            __typeof__(*ckp->dev_donations) *don = ckp->dev_donations + i;
+            __typeof__(*sdata->donation_data) *dd = sdata->donation_data + i;
+            dd->scriptlen = generator_checkaddr(ckp, don->address, dd->scriptbin);
+            if (dd->scriptlen) {
+                don->valid = true;
                 sdata->n_good_donation++;
-                sdata->donation_data[i].txnlen =
-                    address_to_txn(sdata->donation_data[i].txnbin, ckp->dev_donations[i].address,
-                                   ckp->dev_donations[i].isscript, ckp->cashaddr_prefix);
-                if (!sdata->donation_data[i].txnlen) {
-                    LOGEMERG("Failed to parse donation address '%s'. FIXME!", ckp->dev_donations[i].address);
-                    goto out;
-                }
             }
         }
     }
@@ -9987,7 +10154,7 @@ void *stratifier(void *arg)
     mutex_init(&sdata->update_time_lock);
     mutex_init(&sdata->last_hash_lock);
 
-    if (ckp->n_zmq_btcds > 0) {
+    if (ckp->n_zmq_btcds > 0 && !ckp->proxy) {
         create_pthread(&pth_zmqnotify, zmqnotify, ckp);
     }
 
