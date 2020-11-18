@@ -116,8 +116,8 @@ typedef struct timespec ts_t;
 __maybe_unused
 static inline void swap_256(void *dest_p, const void *src_p)
 {
-    uint32_t *dest = dest_p;
-    const uint32_t *src = src_p;
+    uint32_t *dest = (uint32_t *)dest_p;
+    const uint32_t *src = (uint32_t *)src_p;
 
     dest[0] = src[7];
     dest[1] = src[6];
@@ -132,8 +132,8 @@ static inline void swap_256(void *dest_p, const void *src_p)
 __maybe_unused
 static inline void bswap_256(void *dest_p, const void *src_p)
 {
-    uint32_t *dest = dest_p;
-    const uint32_t *src = src_p;
+    uint32_t *dest = (uint32_t *)dest_p;
+    const uint32_t *src = (uint32_t *)src_p;
 
     dest[0] = bswap_32(src[7]);
     dest[1] = bswap_32(src[6]);
@@ -148,8 +148,8 @@ static inline void bswap_256(void *dest_p, const void *src_p)
 __maybe_unused
 static inline void flip_32(void *dest_p, const void *src_p)
 {
-    uint32_t *dest = dest_p;
-    const uint32_t *src = src_p;
+    uint32_t *dest = (uint32_t *)dest_p;
+    const uint32_t *src = (uint32_t *)src_p;
     int i;
 
     for (i = 0; i < 8; i++)
@@ -159,8 +159,8 @@ static inline void flip_32(void *dest_p, const void *src_p)
 __maybe_unused
 static inline void flip_80(void *dest_p, const void *src_p)
 {
-    uint32_t *dest = dest_p;
-    const uint32_t *src = src_p;
+    uint32_t *dest = (uint32_t *)dest_p;
+    const uint32_t *src = (uint32_t *)src_p;
     int i;
 
     for (i = 0; i < 20; i++)
@@ -609,7 +609,7 @@ void *_ckzrealloc(void *old, size_t len, bool zeromem, const char *file, const c
 size_t round_up_page(size_t len);
 
 extern const int hex2bin_tbl[];
-void __bin2hex(void *vs, const void *vp, size_t len);
+size_t __bin2hex(void *vs, const void *vp, size_t len);
 void *bin2hex(const void *vp, size_t len);
 bool _validhex(const char *buf, const char *file, const char *func, const int line);
 #define validhex(buf) _validhex(buf, __FILE__, __func__, __LINE__)
