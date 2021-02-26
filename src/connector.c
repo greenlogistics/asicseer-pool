@@ -775,16 +775,19 @@ static bool send_sender_send(pool_t *ckp, cdata_t *cdata, sender_send_t *sender_
         int ret = write(client->fd, sender_send->buf + sender_send->ofs, sender_send->len);
 
         if (ret < 1) {
-            /* Invalidate clients that block for more than 60 seconds */
-            if (unlikely(client->blocked_time && now_t - client->blocked_time >= 60)) {
-                LOGNOTICE("Client id %"PRId64" fd %d blocked for >60 seconds, disconnecting",
-                      client->id, client->fd);
-                invalidate_client(ckp, cdata, client);
-                goto out_true;
-            }
             if (errno == EAGAIN || errno == EWOULDBLOCK || !ret) {
-                if (!client->blocked_time)
+                if (!client->blocked_time) {
                     client->blocked_time = now_t;
+                } else { // ... client->blocked_time != 0 ...
+                    /* Invalidate clients that block for more than blocking_timeout seconds (default: 60) */
+                    const time_t blocking_timeout = ckp->blocking_timeout > 0 ? ckp->blocking_timeout : 60;
+                    if (unlikely(now_t - client->blocked_time >= blocking_timeout)) {
+                        LOGNOTICE("Client id %"PRId64" fd %d blocked for >%"PRId64" seconds, disconnecting",
+                                  client->id, client->fd, (int64_t)blocking_timeout);
+                        invalidate_client(ckp, cdata, client);
+                        goto out_true;
+                    }
+                }
                 return false;
             }
             LOGINFO("Client id %"PRId64" fd %d disconnected with write errno %d:%s",

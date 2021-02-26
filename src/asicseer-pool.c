@@ -1335,17 +1335,45 @@ static void cancel_pthread(pthread_t *pth)
     pth = NULL;
 }
 
+static pthread_t quitter_thread;
+static int quit_signal = 0;  // sighandler uses this to communicate to quitter_thread_func the signal that was actually received
+
+static void *quitter_thread_func(void *arg)
+{
+#define handle_error(en, msg) do { errno = en; perror(msg); exit(EXIT_FAILURE); } while (0)
+    sigset_t set;
+    int s, dummy;
+    pool_t *ckp = (pool_t *)arg;
+
+    sigemptyset(&set);
+    sigaddset(&set, SIGUSR2);
+    s = pthread_sigmask(SIG_BLOCK, &set, NULL);
+    if (s != 0)
+        handle_error(s, "pthread_sigmask");
+
+    // wait for a signal to arrive from sighandler
+    s = sigwait(&set, &dummy);
+    if (s != 0)
+        handle_error(s, "sigwait");
+
+    // we were woken up and notified by sighandler that we should quit
+    signal(quit_signal, SIG_IGN);
+    signal(SIGTERM, SIG_IGN);
+    LOGWARNING("\n-- Process %s received signal %d, shutting down", ckp->name, quit_signal);
+    cancel_pthread(&ckp->pth_listener);
+    usleep(250000); // wait for printing, cancel to take effect
+    exit(0);
+    return NULL; // not reached
+#undef handle_error
+}
+
 static void sighandler(const int sig)
 {
-    pool_t *ckp = global_ckp;
-
-    signal(sig, SIG_IGN);
-    signal(SIGTERM, SIG_IGN);
-    LOGWARNING("Process %s received signal %d, shutting down",
-           ckp->name, sig);
-
-    cancel_pthread(&ckp->pth_listener);
-    exit(0);
+    quit_signal = sig;
+    // signal thread to wake and exit app gracefully
+    // according to POSIX, pthread_kill is signal safe
+    // see: https://man7.org/linux/man-pages/man7/signal-safety.7.html
+    pthread_kill(quitter_thread, SIGUSR2);
 }
 
 static bool _json_get_string(char **store, const json_t *entry, const char *res)
@@ -1827,6 +1855,7 @@ static void parse_config(pool_t *ckp)
         quit(1, "\"btcsig\" key has been renamed to \"bchsig\". Please update your config file!");
     // /End obsolete key detection
     json_get_string(&ckp->bchaddress, json_conf, "bchaddress");
+    json_get_string(&ckp->single_payout_override, json_conf, "single_payout_override");
     // bchsig
     parse_bchsigs(ckp, json_object_get(json_conf, "bchsig"));
     // pool_fee
@@ -1898,6 +1927,19 @@ static void parse_config(pool_t *ckp)
     arr_val = json_object_get(json_conf, "redirecturl");
     if (arr_val)
         parse_redirecturls(ckp, arr_val);
+
+    json_get_bool(&ckp->disable_dev_donation, json_conf, "disable_dev_donation");
+
+    {
+        // parse blocking_timeout
+        int64_t blocking_timeout = 0;
+        if (!json_get_int64(&blocking_timeout, json_conf, "blocking_timeout") || blocking_timeout < 1)
+            blocking_timeout = 60; // default: 60 seconds
+        ckp->blocking_timeout = (time_t)blocking_timeout;
+        LOGDEBUG("blocking_timeout: %" PRId64 " seconds", (int64_t)ckp->blocking_timeout);
+        if (ckp->blocking_timeout < 10)
+            LOGWARNING("blocking_timeout of %" PRId64 " seconds is very low!", (int64_t)ckp->blocking_timeout);
+    }
 
     json_decref(json_conf);
 }
@@ -2249,7 +2291,7 @@ int main(int argc, char **argv)
         ckp.dev_donations[1].address = (char *) DONATION_ADDRESS_BCHN;
     }
     if (!ckp.bchaddress)
-        ckp.bchaddress = ckp.dev_donations[0].address;
+        quit(0, "Please specify a bchaddress in the configuration file");
     if (!ckp.blockpoll)
         ckp.blockpoll = 100;
     if (!ckp.nonce1length)
@@ -2376,11 +2418,13 @@ int main(int argc, char **argv)
     // ckp.ckpapi = create_ckmsgq(&ckp, "api", &asicseer_pool_api);
     create_pthread(&ckp.pth_listener, listener, &ckp.main);
 
+    create_pthread(&quitter_thread, quitter_thread_func, &ckp); // this does the actual quitting on Ctrl-C
     handler.sa_handler = &sighandler;
     handler.sa_flags = 0;
     sigemptyset(&handler.sa_mask);
     sigaction(SIGTERM, &handler, NULL);
     sigaction(SIGINT, &handler, NULL);
+    sigaction(SIGQUIT, &handler, NULL);
 
     /* Launch separate processes from here */
     prepare_child(&ckp, &ckp.generator, generator, "generator");

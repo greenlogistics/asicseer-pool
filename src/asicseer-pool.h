@@ -286,7 +286,8 @@ struct pool_instance {
     bool not_mainnet; // if true, we are not on main net but rather on test net or regtest net
 
     /* Coinbase data */
-    char *bchaddress; // Address to mine to. In SPLNS mode this is used as a fallback address ok worker address failure, etc, as well as the pool fee address.
+    char *bchaddress; // Address to mine to. In SPLNS mode this is used as a fallback address on worker address failure, etc, as well as the pool fee address.
+    char *single_payout_override; // Override all payouts to a single address.  This is for private pools that use T17s which crash when there are too may outputs in coinbase.
     // optional coinbase scriptsig text. If more than 1 is specified, one is randomly picked each time.
     struct {
         char *sig; // Optional signature to add to coinbase
@@ -300,6 +301,10 @@ struct pool_instance {
     } dev_donations[DONATION_NUM_ADDRESSES];  // [0] = calin, [1] = bchn -- see donation.h
 
     double pool_fee; // comes from "pool_fee" in config, as a percentage. Defaults to 1.0 if unspecified. SPLNS mode only.
+
+    bool disable_dev_donation; // comes from "disable_dev_donation" top level key. Defaults to false if unspecified.
+
+    time_t blocking_timeout; // defaults to 60 seconds, can be set as a top-level option "blocking_timeout" : NN
 
     /* Stratum options */
     server_instance_t **servers;
@@ -401,7 +406,7 @@ bool _ckmsgq_add(ckmsgq_t *ckmsgq, void *data, const char *file, const char *fun
 bool ckmsgq_empty(ckmsgq_t *ckmsgq);
 unix_msg_t *get_unix_msg(proc_instance_t *pi);
 
-pool_t *global_ckp;
+extern pool_t *global_ckp;
 
 bool ping_main(pool_t *ckp);
 void empty_buffer(connsock_t *cs);

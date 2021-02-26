@@ -486,6 +486,8 @@ struct stratifier_data {
 
     uint8_t scriptbin[GENERATOR_MAX_CSCRIPT_LEN]; // pool address redeem script (scriptPubkey)
     int scriptlen; // length of above scriptbin
+    uint8_t single_payout_override_scriptbin[GENERATOR_MAX_CSCRIPT_LEN];
+    int single_payout_override_scriptlen; // length of above script (usually 0 unless single_payout_override = "someaddress..." was in conf file top level)
     struct {
         uint8_t scriptbin[GENERATOR_MAX_CSCRIPT_LEN]; // donation address redeem script (scriptPubkey)
         int scriptlen; // if valid donation address, length of above, otherwise 0
@@ -740,6 +742,17 @@ static int64_t add_user_generation(sdata_t *sdata, workbase_t *wb, cb1_buffer_t 
     // add a timestamp for file writer
     json_set_int64(payout, "time", (int64_t)time(NULL));
 
+    if (sdata->single_payout_override_scriptlen > 0) {
+        // single payout override mode -- just add g64 (total) as a single output and skip the json generation
+        // and the per-user payouts altogether
+        if (g64 >= DUST_LIMIT_SATS) {
+            amt_pos = _add_output(cb_buf, g64, sdata->single_payout_override_scriptbin, sdata->single_payout_override_scriptlen);
+            total = 0;
+        }
+        LOGDEBUG("Single payout override: entire reward of %"PRId64" will go to the override address", g64);
+        goto skip; // and bail to function exit.
+    }
+
     if (unlikely(total_herp <= 0.)) { // paranoia -- should always be false
         LOGWARNING("total_herp is %0.9f!", total_herp);
         goto skip;
@@ -773,31 +786,35 @@ static int64_t add_user_generation(sdata_t *sdata, workbase_t *wb, cb1_buffer_t 
             json_set_double(postponed_entries, user->username, gen->herp);
             continue;
         }
+
+#define TEST_FILL_CB 0 /*PAYOUT_REWARDS*/ /* leave as 0 unless testing large CB payouts */
+#if TEST_FILL_CB > 1
+        if (total >= PAYOUT_DUST) {
+            // this is for testing large payout tx's.
+            int N = TEST_FILL_CB;
+            uint64_t per_out = total / TEST_FILL_CB, rem = total % TEST_FILL_CB;
+            json_set_double(payout_entries, user->username, total / (double)SATOSHIS); // fake it
+            total_fee_discounts = 0; // reset this since we will abort the loop
+            if (per_out < PAYOUT_DUST) {
+                per_out = total;
+                N = 1;
+                rem = 0;
+            }
+            for (int i = 0; i < N; ++i) {
+                const uint64_t rew = per_out + ( i+1 == N ? rem : 0 );
+                total -= rew;
+                amt_pos = _add_output(cb_buf, rew, user->scriptbin, user->scriptlen);
+                LOGDEBUG("User %s outp %d reward %"PRIu64, user->username, 1 + i + payouts, rew);
+            }
+            break; // exit loop. done faking payouts
+        }
+#else
         json_set_double(payout_entries, user->username, total_reward / (double)SATOSHIS);
         if (credit)
             LOGINFO("User %s reward %"PRIu64" + %"PRId64 " fee discount credit (%0.2f%% fee discount) = %1.8f total",
                     user->username, reward, credit, user->fee_discount * 100.0, total_reward / (double)SATOSHIS);
         else
             LOGINFO("User %s reward %1.8f", user->username, total_reward / (double)SATOSHIS);
-
-#define TEST_FILL_CB 0 /* leave as 0 unless testing large CB payouts */
-#if TEST_FILL_CB > 1
-        {
-            // this is for testing large payout tx's.
-            int N = TEST_FILL_CB;
-            uint64_t per_out = total_reward / TEST_FILL_CB, rem = total_reward % TEST_FILL_CB;
-            if (per_out < PAYOUT_DUST) {
-                per_out = total_reward;
-                N = 1;
-                rem = 0;
-            }
-            for (int i = 0; i < N; ++i) {
-                const uint64_t rew = per_out + ( i+1 == N ? rem : 0 );
-                amt_pos = _add_output(cb_buf, rew, user->scriptbin, user->scriptlen);
-                LOGDEBUG("User %s outp %d reward %"PRIu64, user->username, 1 + i + payouts, rew);
-            }
-        }
-#else
         /* Add the user's coinbase reward, using the cached cscript */
         amt_pos = _add_output(cb_buf, total_reward, user->scriptbin, user->scriptlen);
 #endif
@@ -849,7 +866,7 @@ static void add_coinbase_payouts(const pool_t *ckp, workbase_t *wb, cb1_buffer_t
 
     // Generation value
     g64 = wb->coinbasevalue; // generation (reward)
-    f64 = round(g64 * (ckp->pool_fee/100.0)); // pool fee gross (including dev donation)
+    f64 = ceil(g64 * (ckp->pool_fee/100.0)); // pool fee gross (including dev donation)
     pf64 = f64; // pool fee net (minus dev donation), starts off as f64 initially but may be decreased below
     df64 = 0; // total dev donations (10% of f64 * num_devs), 0 initially, may be increased below
     c64 = 0; // leftover change/dust, 0 initially, may increase below, or go below 0 if pool fee was credited back to pool discount users (see add_user_generation)
@@ -859,9 +876,11 @@ static void add_coinbase_payouts(const pool_t *ckp, workbase_t *wb, cb1_buffer_t
 
         // first, add pool fee, if any
         if (likely(f64 >= DUST_LIMIT_SATS && sdata->scriptlen)) {
-            df64 = DONATION_FRACTION > 0 ? (f64 / DONATION_FRACTION) * sdata->n_good_donation : 0;
-            uint64_t don_each = sdata->n_good_donation ? df64 / sdata->n_good_donation : 0;
-            if (unlikely(don_each < DUST_LIMIT_SATS || f64 - df64 < DUST_LIMIT_SATS)) {
+            df64 = DONATION_FRACTION > 0 && !ckp->disable_dev_donation
+                    ? (f64 / DONATION_FRACTION) * sdata->n_good_donation
+                    : 0;
+            uint64_t don_each = sdata->n_good_donation && !ckp->disable_dev_donation ? df64 / sdata->n_good_donation : 0;
+            if (don_each < DUST_LIMIT_SATS || f64 - df64 < DUST_LIMIT_SATS) {
                 // can't make the outputs -- one of them would end up below dust limit. Don't pay out devs here.
                 df64 = 0;
                 don_each = 0;
@@ -6619,6 +6638,7 @@ static json_t *parse_authorize(stratum_instance_t *client, const json_t *params_
 {
     user_instance_t *user;
     pool_t *ckp = client->ckp;
+    sdata_t *sdata = (sdata_t *)ckp->sdata;
     const char *buf, *pass;
     bool ret = false;
     int arr_size;
@@ -6687,9 +6707,20 @@ static json_t *parse_authorize(stratum_instance_t *client, const json_t *params_
             goto out;
         }
     }
-    if (CKP_STANDALONE(ckp))
+    if (CKP_STANDALONE(ckp)) {
         ret = user->bchaddress;
-    else {
+        if (!ret) {
+            ret = sdata && sdata->single_payout_override_scriptlen > 0 && ckp->single_payout_override;
+            if (ret) {
+                // New! allow invalid address in single payout mode
+                LOGINFO("Client %s %s worker %s has invalid bchaddress, allowing anyway (single_payout_override mode)",
+                        client->identity, client->address, buf);
+            } else {
+                LOGINFO("Client %s %s worker %s has invalid bchaddress -- use \"single_payout_override\" in config to support this",
+                        client->identity, client->address, buf);
+            }
+        }
+    } else {
         /* Preauth workers for the first 10 minutes after the user is
          * first authorized by asicseer-db to avoid floods of worker auths.
          * *errnum is implied zero already so ret will be set true */
@@ -6824,12 +6855,22 @@ static void add_submit(pool_t *ckp, stratum_instance_t *client, double sdiff,
     bias = time_bias(bdiff, 300);
     tdiff = sane_tdiff(&now_t, &client->ldc);
 
+#if 0 // Original ck code
     /* Check the difficulty every 240 seconds or as many shares as we
      * should have had in that time, whichever comes first. */
     if (client->ssdc < 72 && tdiff < 240)
         return;
+#else
+    /* Check the difficulty every 30 seconds or as many shares as we
+     * should have had in that time, whichever comes first. */
+    static const double targetSpacing = 3.33333;
+    static const double checkEvery = 30;
+    const int nExpected = round(checkEvery/targetSpacing);
+    if (client->ssdc < nExpected && tdiff < checkEvery)
+        return;
+#endif
 
-    if (diff != client->diff) {
+    if (((int64_t)round(diff)) != client->diff) {
         client->ssdc = 0;
         return;
     }
@@ -10104,15 +10145,29 @@ void *stratifier(void *arg)
             LOGEMERG("Fatal: bchaddress \"%s\" invalid according to bitcoind", ckp->bchaddress);
             goto out;
         }
-
-        for (int i = 0; i < DONATION_NUM_ADDRESSES; ++i) {
-            __typeof__(*ckp->dev_donations) *don = ckp->dev_donations + i;
-            __typeof__(*sdata->donation_data) *dd = sdata->donation_data + i;
-            dd->scriptlen = generator_checkaddr(ckp, don->address, dd->scriptbin);
-            if (dd->scriptlen) {
-                don->valid = true;
-                sdata->n_good_donation++;
+        if (ckp->single_payout_override) {
+            if (!(sdata->single_payout_override_scriptlen = generator_checkaddr(ckp, ckp->single_payout_override,
+                                                                                sdata->single_payout_override_scriptbin))) {
+                LOGEMERG("Fatal: single_payout_override \"%s\" invalid according to bitcoind", ckp->single_payout_override);
+                goto out;
             }
+        }
+
+        if (!ckp->disable_dev_donation) {
+            for (int i = 0; i < DONATION_NUM_ADDRESSES; ++i) {
+                __typeof__(*ckp->dev_donations) *don = ckp->dev_donations + i;
+                __typeof__(*sdata->donation_data) *dd = sdata->donation_data + i;
+                dd->scriptlen = generator_checkaddr(ckp, don->address, dd->scriptbin);
+                if (dd->scriptlen) {
+                    don->valid = true;
+                    sdata->n_good_donation++;
+                }
+            }
+        } else {
+            for (int i = 0; i < DONATION_NUM_ADDRESSES; ++i)
+                ckp->dev_donations[i].valid = false; // ensure cleared
+            sdata->n_good_donation = 0; // ensure cleared
+            LOGINFO("Dev donations disabled due to conf file setting \"disable_dev_donation\"");
         }
     }
 
